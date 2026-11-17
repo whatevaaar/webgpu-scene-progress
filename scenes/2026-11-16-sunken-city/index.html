@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Drowned Metropolis — WebGPU</title>
+<style>
+  html,body{margin:0;height:100%;background:#02100c;overflow:hidden;cursor:crosshair}
+  #c{width:100vw;height:100vh;display:block}
+  #hud{position:fixed;left:10px;top:8px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;
+       color:#6fd;text-shadow:0 0 6px #063;pointer-events:none;white-space:pre}
+  #msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+       font:16px/1.6 ui-monospace,monospace;color:#2fd;text-align:center;padding:24px;pointer-events:none}
+  #hint{position:fixed;left:10px;bottom:8px;font:11px ui-monospace,monospace;color:#5db;opacity:.7;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="hint">Click = pointer lock · WASD move · mouse look · Q/E down/up · Shift boost · (?pose=0..5, ?flythrough=1)</div>
+<div id="msg"></div>
+<script type="module">
+'use strict';
+const canvas = document.getElementById('c');
+const hud = document.getElementById('hud');
+const msg = document.getElementById('msg');
+const fail = (t)=>{ msg.textContent = t; };
+
+const qs = new URLSearchParams(location.search);
+const POSE = qs.has('pose') ? Math.max(0, Math.min(5, +qs.get('pose')|0)) : -1;
+const FLYTHROUGH = qs.get('flythrough') === '1';
+const NO_PART = qs.get('noRain') === '1' || qs.get('noParticles') === '1';
+const NO_VOL = qs.get('noVolumetrics') === '1';
+const NO_FLOCK = qs.get('noFlock') === '1';
+const NO_HERO = qs.get('noHero') === '1' || qs.get('noDrones') === '1';
+const NO_VEG = qs.get('noVeg') === '1';
+const CALIB = qs.get('calib') === '1';   // orientation calibration: green=UP, red=DOWN, yellow=+X right
+if (POSE>=0 || FLYTHROUGH || CALIB){ hud.style.display='none'; const hn=document.getElementById('hint'); if(hn) hn.style.display='none'; }
+const SAMPLES = 4;
+const SS = 1.25;                                      // supersampling factor (render hi-res, downsample in post)
+
+if (!navigator.gpu){ fail('WebGPU not available. Use Chrome/Edge with WebGPU enabled.'); throw new Error('no webgpu'); }
+const adapter = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' });
+if (!adapter){ fail('No WebGPU adapter.'); throw new Error('no adapter'); }
+const canTS = adapter.features.has('timestamp-query');
+const device = await adapter.requestDevice({ requiredFeatures: canTS ? ['timestamp-query'] : [] });
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device, format, alphaMode:'opaque' });
+const HDR = 'rgba16float';
+
+// ---------------------------------------------------------------------------
+// Math (all preallocated — no per-frame allocations)
+// ---------------------------------------------------------------------------
+const mView = new Float32Array(16), mProj = new Float32Array(16), mVP = new Float32Array(16);
+const vF = new Float32Array(3), vR = new Float32Array(3), vU = new Float32Array(3);
+function perspective(o, fovy, asp, n, f){
+  const t = 1/Math.tan(fovy/2);
+  o[0]=t/asp;o[1]=0;o[2]=0;o[3]=0; o[4]=0;o[5]=t;o[6]=0;o[7]=0;
+  o[8]=0;o[9]=0;o[10]=f/(n-f);o[11]=-1; o[12]=0;o[13]=0;o[14]=(f*n)/(n-f);o[15]=0;
+}
+function mul(o,a,b){
+  for(let c=0;c<4;c++){ const bc=c*4;
+    const b0=b[bc],b1=b[bc+1],b2=b[bc+2],b3=b[bc+3];
+    o[bc  ]=a[0]*b0+a[4]*b1+a[8]*b2+a[12]*b3;
+    o[bc+1]=a[1]*b0+a[5]*b1+a[9]*b2+a[13]*b3;
+    o[bc+2]=a[2]*b0+a[6]*b1+a[10]*b2+a[14]*b3;
+    o[bc+3]=a[3]*b0+a[7]*b1+a[11]*b2+a[15]*b3;
+  }
+}
+function viewFrom(px,py,pz,yaw,pitch){
+  const cp=Math.cos(pitch),sp=Math.sin(pitch),cy=Math.cos(yaw),sy=Math.sin(yaw);
+  vF[0]=sy*cp; vF[1]=sp; vF[2]=-cy*cp;
+  vR[0]=-vF[2]; vR[1]=0; vR[2]=vF[0];   // right = normalize(cross(forward, worldUp)); fixes 180° roll
+  let rl=Math.hypot(vR[0],vR[2])||1; vR[0]/=rl; vR[2]/=rl;
+  vU[0]=vR[1]*vF[2]-vR[2]*vF[1]; vU[1]=vR[2]*vF[0]-vR[0]*vF[2]; vU[2]=vR[0]*vF[1]-vR[1]*vF[0];
+  const dr=vR[0]*px+vR[1]*py+vR[2]*pz, du=vU[0]*px+vU[1]*py+vU[2]*pz, df=vF[0]*px+vF[1]*py+vF[2]*pz;
+  mView[0]=vR[0];mView[1]=vU[0];mView[2]=-vF[0];mView[3]=0;
+  mView[4]=vR[1];mView[5]=vU[1];mView[6]=-vF[1];mView[7]=0;
+  mView[8]=vR[2];mView[9]=vU[2];mView[10]=-vF[2];mView[11]=0;
+  mView[12]=-dr;mView[13]=-du;mView[14]=df;mView[15]=1;
+}
+function mulberry32(a){ return function(){ a|=0;a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+const rnd = mulberry32(0x1a7b9e05);
+
+// ---------------------------------------------------------------------------
+// Base meshes (layout: position.xyz, normal.xyz)
+// ---------------------------------------------------------------------------
+function makeCube(){
+  const p=[[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1],[-1,-1,-1],[-1,1,-1],[1,1,-1],[1,-1,-1],
+           [-1,1,-1],[-1,1,1],[1,1,1],[1,1,-1],[-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1],
+           [1,-1,-1],[1,1,-1],[1,1,1],[1,-1,1],[-1,-1,-1],[-1,-1,1],[-1,1,1],[-1,1,-1]];
+  const n=[[0,0,1],[0,0,-1],[0,1,0],[0,-1,0],[1,0,0],[-1,0,0]];
+  const v=new Float32Array(24*6);
+  for(let f=0;f<6;f++)for(let k=0;k<4;k++){ const i=(f*4+k)*6,P=p[f*4+k],N=n[f];
+    v[i]=P[0];v[i+1]=P[1];v[i+2]=P[2];v[i+3]=N[0];v[i+4]=N[1];v[i+5]=N[2]; }
+  const idx=new Uint16Array(36);
+  for(let f=0;f<6;f++){ const o=f*4,b=f*6; idx[b]=o;idx[b+1]=o+1;idx[b+2]=o+2;idx[b+3]=o;idx[b+4]=o+2;idx[b+5]=o+3; }
+  return {v,idx};
+}
+function makePlane(size, seg){
+  const v=new Float32Array((seg+1)*(seg+1)*6); let p=0;
+  for(let z=0;z<=seg;z++)for(let x=0;x<=seg;x++){
+    v[p++]=(x/seg-0.5)*size; v[p++]=0; v[p++]=(z/seg-0.5)*size; v[p++]=0; v[p++]=1; v[p++]=0; }
+  const idx=new Uint32Array(seg*seg*6); let q=0;
+  for(let z=0;z<seg;z++)for(let x=0;x<seg;x++){ const a=z*(seg+1)+x,b=a+1,c=a+seg+1,d=c+1;
+    idx[q++]=a;idx[q++]=c;idx[q++]=b;idx[q++]=b;idx[q++]=c;idx[q++]=d; }
+  return {v,idx,u32:true};
+}
+function makeHemisphere(rings, sectors){
+  const verts=[],ind=[];
+  for(let r=0;r<=rings;r++){ const phi=(r/rings)*(Math.PI*0.5); const y=Math.cos(phi), rad=Math.sin(phi);
+    for(let s=0;s<=sectors;s++){ const th=(s/sectors)*Math.PI*2; const x=rad*Math.cos(th), z=rad*Math.sin(th);
+      verts.push(x,y,z,x,y,z); } }
+  const row=sectors+1;
+  for(let r=0;r<rings;r++)for(let s=0;s<sectors;s++){ const a=r*row+s,b=a+1,c=a+row,d=c+1;
+    ind.push(a,c,b,b,c,d); }
+  return {v:new Float32Array(verts),idx:new Uint16Array(ind)};
+}
+function makeCone(seg){
+  const verts=[],ind=[]; const h=1.0;
+  verts.push(0,h,0, 0,1,0);
+  for(let s=0;s<=seg;s++){ const th=(s/seg)*Math.PI*2; const x=Math.cos(th),z=Math.sin(th);
+    verts.push(x,0,z, x*0.8,0.5,z*0.8); }
+  for(let s=0;s<seg;s++){ ind.push(0, 1+s, 1+((s+1)%seg)); }
+  return {v:new Float32Array(verts),idx:new Uint16Array(ind)};
+}
+function gpuMesh(m){
+  const vb=device.createBuffer({size:m.v.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(vb,0,m.v);
+  let idx=m.idx;                                         // WebGPU writeBuffer size must be a multiple of 4
+  if(idx.BYTES_PER_ELEMENT===2 && (idx.length&1)){ const p=new Uint16Array(idx.length+1); p.set(idx); idx=p; }
+  const ib=device.createBuffer({size:idx.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST});
+  device.queue.writeBuffer(ib,0,idx);
+  return {vb,ib,count:m.idx.length,fmt:m.u32?'uint32':'uint16'};
+}
+const cube=gpuMesh(makeCube());
+const plane=gpuMesh(makePlane(520,200));
+const dome=gpuMesh(makeHemisphere(18,30));
+const coralMesh=gpuMesh(makeCone(7));
+const manta=gpuMesh(makePlane(1,20));
+
+// ---------------------------------------------------------------------------
+// Instances (12 floats): posScale.xyzw, color.rgb+emissive, prm[rotY, kind, scaleY, phase/lean]
+// mesh kinds: 0 building/towers 1 hero manta 2 fish-flock 3 seabed 4 dome/stadium
+//             5 coral 6 metal debris (cars/plane) 7 calib marker
+// ---------------------------------------------------------------------------
+function instBuf(arr){ const b=device.createBuffer({size:arr.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST}); device.queue.writeBuffer(b,0,arr); return b; }
+function pack(list){ const a=new Float32Array(list.length*12);
+  for(let i=0;i<list.length;i++){ const o=i*12; for(let k=0;k<12;k++)a[o+k]=list[i][k]; } return a; }
+
+// --- Skyscraper canyons: dense jittered grid of leaning coralized towers ---
+const buildings=[];
+const GN=15, GS=30;
+for(let gx=0;gx<GN;gx++)for(let gz=0;gz<GN;gz++){
+  const x=(gx-(GN-1)/2)*GS+(rnd()-0.5)*12, z=(gz-(GN-1)/2)*GS+(rnd()-0.5)*12;
+  const d=Math.hypot(x,z); if(d<26) continue;             // clear starting avenue
+  if(Math.hypot(x+40,z+44)<34) continue;                  // clear stadium lagoon plaza
+  if(Math.hypot(x-34,z-20)<15) continue;                  // clear a plaza around the obelisk monument
+  const w=6+rnd()*7, h=54+rnd()*70;
+  const tone=0.15+rnd()*0.10;
+  const cr=tone*0.7, cg=tone*1.25, cb=tone*1.0;           // drowned concrete, green-teal cast
+  const lean=(rnd()-0.5)*0.16;                            // leaning towers
+  buildings.push([x,h/2,z,w, cr,cg,cb,0.0, rnd()*6.28,0,h/(2*w),lean]);
+}
+// --- Set piece 1: the SNAPPED hero skyscraper leaning across the start avenue ---
+buildings.push([ -6, 60,-10, 13, 0.17,0.25,0.21,0.0, 0.3,0,60/26, 0.0]);     // lower stump, upright
+buildings.push([ 14, 46, 18, 11, 0.17,0.25,0.21,0.0, 0.9,0,46/22, 0.52]);    // upper half, snapped & leaning hard
+const bBuf=instBuf(pack(buildings)); const bCount=buildings.length;
+
+// --- Metal debris: crashed airliner parts + coralized cars/signs on the seabed ---
+const debris=[];
+// crashed airliner draped across two towers near the core
+debris.push([ 58, 8,-66, 3.0, 0.14,0.12,0.10,0.0, 0.6,6, 7.0, 1.30]);        // fuselage laid on its side (crashed on the seabed)
+debris.push([ 50, 5,-58, 2.2, 0.13,0.11,0.09,0.0, 0.6,6, 0.4, 0.30]);        // wing
+debris.push([ 66, 5,-74, 2.2, 0.13,0.11,0.09,0.0, 2.2,6, 0.4, 0.30]);        // wing
+for(let i=0;i<70;i++){ const a=rnd()*6.28,r=18+rnd()*150; const x=Math.cos(a)*r,z=Math.sin(a)*r;
+  debris.push([x,0.2+rnd()*0.5,z,1.4+rnd()*1.6, 0.10,0.12,0.10,0.0, rnd()*6.28,6, 0.4+rnd()*0.3, rnd()*0.3]); } // cars on the seabed
+const debBuf=instBuf(pack(debris)); const debCount=debris.length;
+
+// --- Set piece 2: submerged civic monument (coralized obelisk) ---
+// --- Set piece 3: collapsed stadium dome -> bioluminescent amphitheater lagoon ---
+const domeInst=instBuf(pack([[ -40,-5,-44, 32, 0.10,0.45,0.42, 1.0, 0,4,0.42, 0]]));
+const statueInst=instBuf(pack([[ 34,0,20, 4.5, 0.95,0.25,0.75, 1.0, 0,5, 6.0, 0]]));   // tall coral obelisk monument
+
+// --- Hero creature: a colossal manta gliding through the canyons ---
+const heroInst=instBuf(pack([[0,0,0, 20, 0.05,0.14,0.13, 0.0, 0,1,1, 0]]));
+
+// --- Fish school (murmuration / flocking look) ---
+const flock=[];
+for(let i=0;i<70;i++){ flock.push([0,0,0,0.18+rnd()*0.13, 0.4,0.6,0.5, 1.0, 0,2,0.45, i*0.618]); }
+const fBuf=instBuf(pack(flock)); const fCount=flock.length;
+
+// --- Coral: branching neon colonies on the seabed and clustered around towers ---
+const coral=[]; const CORALC=[[1.0,0.12,0.62],[0.08,0.9,1.0],[0.45,1.0,0.3],[1.0,0.35,0.85]];
+for(let i=0;i<1900;i++){
+  const a=rnd()*6.28, r=8+rnd()*190; const x=Math.cos(a)*r, z=Math.sin(a)*r;
+  let blocked=false;                                        // don't scatter coral inside tower footprints
+  for(let b=0;b<buildings.length;b++){ const B=buildings[b]; const m=B[3]+1.5; if(Math.abs(x-B[0])<m&&Math.abs(z-B[2])<m){blocked=true;break;} }
+  if(blocked) continue;
+  const c=CORALC[(rnd()*4)|0]; const s=0.7+rnd()*1.9;
+  coral.push([x,-0.7,z,s, c[0],c[1],c[2],1.0, rnd()*6.28,5, 1.6+rnd()*2.2, rnd()*6.28]);  // base sunk so it roots into the seabed
+}
+const coralBuf=instBuf(pack(coral)); const coralCount=coral.length;
+
+const groundInst=instBuf(pack([[0,0,0,1, 0.03,0.08,0.06,0, 0,3,1,0]]));
+const markerScratch=new Float32Array(36);   // calib: 3 orientation markers (up/down/right)
+const markerBuf=device.createBuffer({size:144,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST});
+
+// ---------------------------------------------------------------------------
+// Sprite instances (12 floats): ps.xyzw (pos+size), col.rgb+a, prm[kind, phase, sway, aux]
+// sprite kinds: 0 kelp  2 jellyfish  4 marine-snow  5 bubbles  6 glowing spores
+// ---------------------------------------------------------------------------
+function packS(list){ const a=new Float32Array(list.length*12);
+  for(let i=0;i<list.length;i++){ const o=i*12; for(let k=0;k<12;k++)a[o+k]=list[i][k]; } return a; }
+const kelp=[];
+for(let i=0;i<850;i++){ const a=rnd()*6.28, r=10+rnd()*180; const x=Math.cos(a)*r, z=Math.sin(a)*r;
+  const g=0.5+rnd()*0.4; kelp.push([x,-0.5,z, 4+rnd()*5, 0.12*g,0.42*g,0.18*g, 1.0, 0, rnd()*6.28, 0.4+rnd()*0.5, 0]); }
+const kelpBuf=instBuf(packS(kelp)); const kelpCount=kelp.length;
+
+const jelly=[]; const JC=[[1.0,0.3,0.8],[0.3,0.8,1.0],[0.6,1.0,0.6]];
+for(let i=0;i<64;i++){ const a=rnd()*6.28,r=14+rnd()*150; const x=Math.cos(a)*r,z=Math.sin(a)*r;
+  const c=JC[(rnd()*3)|0]; jelly.push([x, 12+rnd()*44, z, 2.0+rnd()*2.4, c[0],c[1],c[2],1.0, 2, rnd()*6.28, 0.0, 0]); }
+const jellyBuf=instBuf(packS(jelly)); const jellyCount=jelly.length;
+
+const SNOWN = NO_PART?0:3200;
+const snow=[];
+for(let i=0;i<SNOWN;i++){ snow.push([(rnd()-0.5)*120, 0, (rnd()-0.5)*120, 0.12+rnd()*0.18,
+  0.7,0.85,0.7, 1.0, 4, rnd()*60, rnd()*6.28, 1]); }
+const snowBuf=snow.length?instBuf(packS(snow)):null; const snowCount=snow.length;
+
+const BUBN = NO_PART?0:700;
+const bub=[];
+for(let i=0;i<BUBN;i++){ bub.push([(rnd()-0.5)*110, 0, (rnd()-0.5)*110, 0.1+rnd()*0.22,
+  0.6,1.0,0.9, 1.0, 5, rnd()*50, rnd()*6.28, 1]); }
+const bubBuf=bub.length?instBuf(packS(bub)):null; const bubCount=bub.length;
+
+const SPON = NO_PART?0:1400;
+const spore=[];
+for(let i=0;i<SPON;i++){ spore.push([(rnd()-0.5)*100, (rnd()-0.5)*70, (rnd()-0.5)*100, 0.08+rnd()*0.12,
+  0.5,1.0,0.6, 1.0, 6, rnd()*6.28, rnd()*6.28, 1]); }
+const sporeBuf=spore.length?instBuf(packS(spore)):null; const sporeCount=spore.length;
+
+const quadV=new Float32Array([ -0.5,0,0,0,  0.5,0,1,0,  0.5,1,1,1,  -0.5,1,0,1 ]);
+const quadI=new Uint16Array([0,1,2,0,2,3]);
+const quadVB=device.createBuffer({size:quadV.byteLength,usage:GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST}); device.queue.writeBuffer(quadVB,0,quadV);
+const quadIB=device.createBuffer({size:quadI.byteLength,usage:GPUBufferUsage.INDEX|GPUBufferUsage.COPY_DST}); device.queue.writeBuffer(quadIB,0,quadI);
+
+const U = new Float32Array(64);
+const uBuf = device.createBuffer({ size:256, usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+
+// ---------------------------------------------------------------------------
+// WGSL
+// ---------------------------------------------------------------------------
+const NOISE = `
+fn hash12(p:vec2<f32>)->f32{ var p3=fract(vec3<f32>(p.x,p.y,p.x)*0.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+fn vnoise(p:vec2<f32>)->f32{ let i=floor(p); let f=fract(p); let u=f*f*(3.0-2.0*f);
+  let a=hash12(i); let b=hash12(i+vec2<f32>(1.0,0.0)); let c=hash12(i+vec2<f32>(0.0,1.0)); let d=hash12(i+vec2<f32>(1.0,1.0));
+  return mix(mix(a,b,u.x),mix(c,d,u.x),u.y); }
+fn fbm(p:vec2<f32>)->f32{ var s=0.0; var a=0.5; var q=p; for(var i=0;i<5;i=i+1){ s+=a*vnoise(q); q*=2.02; a*=0.5; } return s; }
+fn hash31(p:f32)->vec3<f32>{ var p3=fract(vec3<f32>(p,p,p)*vec3<f32>(0.1031,0.1030,0.0973)); p3+=dot(p3,p3.yzx+33.33); return fract((p3.xxy+p3.yzz)*p3.zyx); }
+`;
+const UNI = `
+struct U{
+  vp:mat4x4<f32>, camPos:vec4<f32>, camR:vec4<f32>, camU:vec4<f32>,
+  fogN:vec4<f32>, fogF:vec4<f32>, lightP:vec4<f32>, lightC:vec4<f32>, misc:vec4<f32> };
+@group(0) @binding(0) var<uniform> u:U;
+fn applyFog(col:vec3<f32>, dist:f32)->vec3<f32>{
+  let fogCol=mix(u.fogN.rgb, u.fogF.rgb, clamp(dist/u.fogF.w,0.0,1.0));
+  let amt=1.0-exp(-dist*u.fogN.w);
+  return mix(col, fogCol, amt);
+}
+`;
+// Underwater backdrop — murky green gradient with bright sickly surface above
+const skyWGSL = UNI + `
+struct Vo{ @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi:u32)->Vo{
+  var o:Vo; let p=vec2<f32>(f32((vi<<1u)&2u), f32(vi&2u));
+  o.pos=vec4<f32>(p*2.0-1.0,1.0,1.0); o.uv=vec2<f32>(p.x,1.0-p.y); return o; }
+@fragment fn fs(i:Vo)->@location(0) vec4<f32>{
+  let up=i.uv.y;                                   // 0 top (toward surface) .. 1 bottom (abyss)
+  var col=mix(u.fogF.rgb*0.8, u.fogN.rgb*0.9, pow(clamp(up,0.0,1.0),1.4));  // murky zenith → acid-green horizon, no bright lid
+  col += u.fogN.rgb*0.25*pow(clamp(1.0-up,0.0,1.0),3.0);  // faint glow toward the distant surface
+  let d=distance(i.uv, u.misc.xy);                 // sun shimmer at the surface
+  col += u.lightC.rgb*exp(-d*4.0)*0.7*u.lightC.w;
+  let dn=fract(sin(dot(i.pos.xy,vec2<f32>(12.9898,78.233)))*43758.5453)-0.5;
+  col += dn/150.0;
+  return vec4<f32>(col,1.0); }
+`;
+const meshWGSL = UNI + NOISE + `
+fn aapulse(coord:f32, duty:f32)->f32{ let f=fract(coord); let w=fwidth(coord)*2.2+0.002;
+  return smoothstep(0.5-duty-w,0.5-duty+w,f)-smoothstep(0.5+duty-w,0.5+duty+w,f); }
+struct Vin{ @location(0) pos:vec3<f32>, @location(1) nrm:vec3<f32>,
+  @location(2) ps:vec4<f32>, @location(3) col:vec4<f32>, @location(4) prm:vec4<f32> };
+struct Vout{ @builtin(position) clip:vec4<f32>, @location(0) wpos:vec3<f32>, @location(1) nrm:vec3<f32>,
+  @location(2) col:vec3<f32>, @location(3) emis:f32, @location(4) kind:f32, @location(5) uv:vec2<f32> };
+@vertex fn vs(i:Vin)->Vout{
+  var o:Vout; let t=u.camPos.w; let kind=i.prm.y;
+  let s=vec3<f32>(i.ps.w, i.ps.w*i.prm.z, i.ps.w);
+  let a=i.prm.x; let ca=cos(a); let sa=sin(a);
+  var lp=i.pos*s;
+  var nrm=i.nrm;
+  // yaw rotate
+  let rx=lp.x*ca - lp.z*sa; let rz=lp.x*sa + lp.z*ca; lp=vec3<f32>(rx,lp.y,rz);
+  let nrx=nrm.x*ca - nrm.z*sa; let nrz=nrm.x*sa + nrm.z*ca; nrm=vec3<f32>(nrx,nrm.y,nrz);
+  if(kind<0.5 || (kind>5.5 && kind<6.5)){ // towers + debris: lean/tilt about X (prm.w)
+    let ln=i.prm.w; let cl=cos(ln); let sl=sin(ln);
+    let ty=lp.y*cl - lp.z*sl; let tz=lp.y*sl + lp.z*cl; lp=vec3<f32>(lp.x,ty,tz);
+    let nty=nrm.y*cl - nrm.z*sl; let ntz=nrm.y*sl + nrm.z*cl; nrm=vec3<f32>(nrm.x,nty,ntz);
+  }
+  var wp=lp + i.ps.xyz;
+  if(kind>2.5 && kind<3.5){ // seabed: near-flat with faint undulation (keeps props rooted)
+    let h=fbm(wp.xz*0.02)*2.0 - 0.8; wp.y=h;
+    let e=1.2; let hx=fbm((wp.xz+vec2<f32>(e,0.0))*0.02)*2.0; let hz=fbm((wp.xz+vec2<f32>(0.0,e))*0.02)*2.0;
+    nrm=normalize(vec3<f32>(-(hx-h-0.8),e,-(hz-h-0.8))); }
+  if(kind>4.5 && kind<5.5){ let ph=i.prm.w; wp.x+=sin(t*0.5+ph)*0.12*lp.y; wp.z+=cos(t*0.45+ph)*0.12*lp.y; } // coral sway
+  if(kind>0.5 && kind<1.5){ // hero manta: shape a plane into a gliding ray on a slow path
+    let L=i.pos; let wing=abs(L.x)*2.0;
+    var py=sin(t*0.9 + abs(L.x)*7.0)*wing*0.22;           // wing flap
+    py+=(1.0-wing)*0.14*cos(L.z*3.14);                     // body thickness
+    let taper=1.0 - smoothstep(0.18,0.5,abs(L.z))*0.5;     // gentle diamond — no self-folding
+    var ml=vec3<f32>(L.x*i.ps.w*2.1*taper, py*i.ps.w*0.55, L.z*i.ps.w*1.8);
+    let ang=t*0.045; let R=78.0;
+    let hd=ang+1.5708;                                     // heading tangent to the circular path
+    let ch=cos(hd); let sh=sin(hd);
+    let mx=ml.x*ch - ml.z*sh; let mz=ml.x*sh + ml.z*ch;
+    wp=vec3<f32>(cos(ang)*R + mx, 34.0+sin(t*0.1)*7.0 + ml.y, sin(ang)*R + mz);
+    nrm=vec3<f32>(0.0,1.0,0.0);
+  }
+  if(kind>1.5 && kind<2.5){ let ph=i.prm.w; let r=hash31(ph*13.0);  // fish school snaking down a canyon
+    let cx=sin(t*0.09)*50.0; let cz=-20.0 - (t*7.0)%220.0 + 110.0; let cy=16.0+sin(t*0.3)*6.0; let sw=9.0;
+    wp.x=cx + sin(t*0.7+r.x*6.28)*sw*(0.4+r.y) + (r.x-0.5)*10.0;
+    wp.z=cz + cos(t*0.6+r.y*6.28)*sw*(0.4+r.z) + (r.z-0.5)*12.0;
+    wp.y=cy + sin(t*1.1+r.z*6.28)*5.0 + (r.y-0.5)*8.0; wp += lp; }
+  o.wpos=wp; o.nrm=nrm; o.col=i.col.rgb; o.emis=i.col.w; o.kind=kind;
+  o.uv=vec2<f32>(i.pos.x, i.pos.y);
+  o.clip=u.vp*vec4<f32>(wp,1.0);
+  return o;
+}
+@fragment fn fs(i:Vout)->@location(0) vec4<f32>{
+  let t=u.camPos.w;
+  let toL=normalize(u.lightP.xyz - i.wpos);
+  let ndl=max(dot(normalize(i.nrm),toL),0.0);
+  let dist=length(i.wpos - u.camPos.xyz);
+  var base=i.col; var emis=i.emis;
+  // window grid (computed unconditionally: fwidth needs uniform control flow)
+  let wcy=i.wpos.y*0.7; let wch=(i.wpos.x+i.wpos.z)*0.7;
+  let win=aapulse(wcy,0.14)*aapulse(wch,0.16);
+  let wcell=floor(wcy)*7.0+floor(wch)*13.0;
+  let wonoff=step(0.45, hash12(vec2<f32>(wcell, wcell*0.37)));  // dense facade grid, scattered lit windows
+  let flick=0.5+0.5*sin(t*7.0 + wcell*3.0);
+  let slab=aapulse(i.wpos.y*0.33,0.42);              // facade floor slabs (fwidth: computed in uniform flow)
+  let dn=normalize(i.nrm);                           // dome geodesic struts
+  let dstrut=max(aapulse(acos(clamp(dn.y,-1.0,1.0))*5.0,0.05), aapulse(atan2(dn.z,dn.x)*5.0,0.05));
+  // coral encrustation mask reused for towers & debris
+  let crust=pow(fbm(i.wpos.xz*0.5 + vec2<f32>(i.wpos.y*0.1, i.wpos.y*0.07)),2.2);
+  if(i.kind<0.5){ // tower: drowned concrete + dying neon windows + coral crust creeping up
+    let df=clamp(1.0-(dist-20.0)*0.011, 0.0, 1.0);   // windows read as facades much farther out
+    let wcol=mix(vec3<f32>(0.95,0.78,0.3), vec3<f32>(0.3,0.9,0.95), hash12(vec2<f32>(wcell*1.7, wcell)));  // amber & cyan lit windows
+    emis += win*wonoff*(0.5+0.5*flick)*0.95*df;      // moderate so windows don't clip to pure white
+    base = mix(base, wcol, win*wonoff*df*0.85);
+    let lowc=smoothstep(60.0,4.0,i.wpos.y)*crust;    // coral thicker near the seabed
+    base = mix(base, vec3<f32>(0.9,0.15,0.6), lowc*0.5);
+    emis += lowc*0.5;
+    base *= 0.78+0.22*abs(dn.x)+0.10*abs(dn.z);      // face-dependent shading → towers read as 3D prisms, not flat walls
+    base *= 0.80+0.20*slab;                          // horizontal floor-slab lines give the facade structure
+    base *= 1.0 - 0.55*smoothstep(0.6,1.0,dn.y);     // darken flat rooftops so they don't read as a bright "ceiling" band
+  }
+  if(i.kind>2.5 && i.kind<3.5){ // seabed: caustic dapple + coral-dust tint
+    let caus=pow(fbm(i.wpos.xz*0.09 + vec2<f32>(t*0.04,t*0.03)),3.0);
+    let tint=mix(vec3<f32>(0.1,0.8,0.5), vec3<f32>(0.6,0.15,0.5), fbm(i.wpos.xz*0.025));
+    base += tint*caus*2.4 + vec3<f32>(0.05,0.11,0.08);   // lift the seabed so coral reads as grounded, not floating
+  }
+  if(i.kind>3.5 && i.kind<4.5){ // collapsed stadium dome: sunken amphitheater, dim glowing struts
+    let v=normalize(u.camPos.xyz-i.wpos); let fres=pow(1.0-abs(dot(normalize(i.nrm),v)),2.0);
+    base=mix(vec3<f32>(0.04,0.15,0.12), i.col, dstrut);
+    emis = 0.16 + dstrut*0.85 + fres*0.5;
+  }
+  if(i.kind>4.5 && i.kind<5.5){ emis = 1.1 + 0.7*sin(t*1.6 + i.wpos.y*0.5 + i.wpos.x*0.3 + i.wpos.z*0.2); } // coral bioluminescence pulse
+  if(i.kind>5.5 && i.kind<6.5){ // metal debris: dark rusty hull + coral spots
+    base = mix(vec3<f32>(0.12,0.11,0.09), vec3<f32>(0.2,0.1,0.07), fbm(i.wpos.xz*0.3));
+    let spot=step(0.72,crust); base=mix(base, vec3<f32>(0.1,0.9,0.9), spot*0.5); emis+=spot*0.5;
+  }
+  if(i.kind>0.5 && i.kind<1.5){ // hero manta: dark body, glowing belly reads as a creature from below
+    let under=step(i.wpos.y, u.camPos.y);
+    let spot=pow(fbm(i.uv*5.0),2.0);
+    base=vec3<f32>(0.03,0.11,0.11);
+    emis=0.25 + spot*1.4 + 0.5*under*(0.5+0.5*sin(t*1.5));
+    base=mix(base, vec3<f32>(0.25,0.95,0.98), spot*0.8);
+  }
+  if(i.kind>1.5 && i.kind<2.5){ base=vec3<f32>(0.35,0.55,0.48); emis=0.09*exp(-dist*0.02) + 0.03; }   // fish: dim silver-green glint
+  let amb=mix(u.fogN.rgb,u.fogF.rgb,0.35)*1.45 + vec3<f32>(0.05,0.13,0.10);
+  var lit = base*(amb + u.lightC.rgb*ndl*u.lightP.w*0.35) + base*emis*1.5;
+  lit = applyFog(lit, dist);
+  let hz = select(0.0, smoothstep(75.0,155.0,i.wpos.y)*0.55, i.kind<3.5);  // height murk on towers (keeps rooftop silhouettes)
+  lit = mix(lit, mix(u.fogN.rgb,u.fogF.rgb,0.6)*0.5, hz);
+  lit = max(lit, u.fogF.rgb*0.45 + vec3<f32>(0.005,0.02,0.015)); // luminance floor: no pure-black pockets
+  if(i.kind>6.5){ lit = i.col*2.0; }                  // calibration marker override (uniform flow — after all fwidth)
+  return vec4<f32>(lit,1.0);
+}`;
+const spriteWGSL = UNI + `
+struct Vin{ @location(0) corner:vec2<f32>, @location(1) uv:vec2<f32>,
+  @location(2) ps:vec4<f32>, @location(3) col:vec4<f32>, @location(4) prm:vec4<f32> };
+struct Vout{ @builtin(position) clip:vec4<f32>, @location(0) uv:vec2<f32>, @location(1) col:vec3<f32>,
+  @location(2) kind:f32, @location(3) fade:f32, @location(4) pulse:f32 };
+@vertex fn vs(i:Vin)->Vout{
+  var o:Vout; let t=u.camPos.w; let kind=i.prm.x; let ph=i.prm.y;
+  var wp=i.ps.xyz; let size=i.ps.w;
+  // particle kinds wrap around the camera in a moving box
+  if(kind>3.5 && kind<4.5){ let range=80.0; wp.x=u.camPos.x+i.ps.x; wp.z=u.camPos.z+i.ps.z;  // marine snow: slow fall
+    wp.y=u.camPos.y+range*0.5 - (t*4.0+ph*6.0)%range; }
+  if(kind>4.5 && kind<5.5){ let range=90.0; wp.x=u.camPos.x+i.ps.x + sin(t*0.7+ph)*0.6; wp.z=u.camPos.z+i.ps.z; // bubbles: rise
+    wp.y=u.camPos.y-range*0.5 + (t*9.0+ph*6.0)%range; }
+  if(kind>5.5){ let range=70.0; wp.x=u.camPos.x+i.ps.x + sin(t*0.25+ph)*3.0;                  // spores: drift
+    wp.z=u.camPos.z+i.ps.z + cos(t*0.2+ph*1.3)*3.0;
+    wp.y=u.camPos.y+range*0.5 - (t*1.2+ph*6.0+i.ps.y)%range; }
+  var right=u.camR.xyz; var up=vec3<f32>(0.0,1.0,0.0);
+  let isBill = kind>1.5;
+  if(isBill){ right=normalize(cross(up,normalize(u.camPos.xyz-wp))); }
+  let sway=sin(t*0.9+ph)*i.prm.z*i.corner.y;
+  let aspectY = select(size, size*(select(1.0, 2.2, kind<0.5)), true);  // kelp: short frond
+  let wpos = wp + right*(i.corner.x*size*(select(1.0,0.12,kind<0.5))+sway) + up*(i.uv.y*aspectY*select(1.0, 0.5, isBill && kind<2.5));
+  let dist=length(wpos-u.camPos.xyz);
+  o.fade=exp(-dist*u.fogN.w*select(1.0, 1.6, kind<0.5));
+  o.pulse = select(1.0, 0.35+0.65*(0.5+0.5*sin(t*1.6+ph)), kind>1.5 && kind<2.5);  // jellyfish pulse
+  o.uv=i.uv; o.col=i.col.rgb; o.kind=kind;
+  o.clip=u.vp*vec4<f32>(wpos,1.0);
+  return o;
+}
+@fragment fn fs(i:Vout)->@location(0) vec4<f32>{
+  var a:f32; var k=1.0;
+  if(i.kind<0.5){ let d=abs(i.uv.x-0.5); a=smoothstep(0.5,0.1,d)*(1.0-i.uv.y*0.45); k=0.55; }       // kelp frond (dim, won't wash white)
+  else if(i.kind>1.5 && i.kind<2.5){ let d=distance(i.uv,vec2<f32>(0.5,0.6));                       // jellyfish bell
+    a=smoothstep(0.5,0.08,d)*0.5; let tent=smoothstep(0.2,0.0,abs(i.uv.x-0.5))*step(i.uv.y,0.4)*0.3; a+=tent; k=0.8; }
+  else { let d=distance(i.uv,vec2<f32>(0.5,0.5)); a=smoothstep(0.5,0.0,d)*0.5; k=0.7; }             // round particles
+  let col=i.col*i.pulse*i.fade*k;
+  return vec4<f32>(col*a, a);
+}`;
+const bloomWGSL = `
+@group(0) @binding(0) var samp:sampler;
+@group(0) @binding(1) var tex:texture_2d<f32>;
+struct Vo{ @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi:u32)->Vo{
+  var o:Vo; let p=vec2<f32>(f32((vi<<1u)&2u), f32(vi&2u));
+  o.pos=vec4<f32>(p*2.0-1.0,0.0,1.0); o.uv=vec2<f32>(p.x,1.0-p.y); return o; }
+@fragment fn fs(i:Vo)->@location(0) vec4<f32>{
+  let dim=vec2<f32>(textureDimensions(tex)); let texel=1.0/dim;
+  var sum=vec3<f32>(0.0); var wsum=0.0;
+  for(var y=-2;y<=2;y=y+1){ for(var x=-2;x<=2;x=x+1){
+    let w=exp(-f32(x*x+y*y)/4.0);
+    var s=textureSample(tex,samp,i.uv+vec2<f32>(f32(x),f32(y))*texel*3.2).rgb;
+    let l=max(max(s.r,s.g),s.b);
+    s=s*max(l-0.6,0.0)/max(l,0.001);
+    sum+=s*w; wsum+=w; } }
+  return vec4<f32>(sum/wsum,1.0); }
+`;
+const postWGSL = UNI + `
+@group(0) @binding(1) var samp:sampler;
+@group(0) @binding(2) var hdr:texture_2d<f32>;
+@group(0) @binding(3) var bloom:texture_2d<f32>;
+struct Vo{ @builtin(position) pos:vec4<f32>, @location(0) uv:vec2<f32> };
+@vertex fn vs(@builtin(vertex_index) vi:u32)->Vo{
+  var o:Vo; let p=vec2<f32>(f32((vi<<1u)&2u), f32(vi&2u));
+  o.pos=vec4<f32>(p*2.0-1.0,0.0,1.0); o.uv=vec2<f32>(p.x,1.0-p.y); return o; }
+fn aces(x:vec3<f32>)->vec3<f32>{ let a=2.51;let b=0.03;let c=2.43;let d=0.59;let e=0.14;
+  return clamp((x*(a*x+b))/(x*(c*x+d)+e),vec3<f32>(0.0),vec3<f32>(1.0)); }
+@fragment fn fs(i:Vo)->@location(0) vec4<f32>{
+  var col=textureSample(hdr,samp,i.uv).rgb;
+  col += textureSample(bloom,samp,i.uv).rgb*0.9;              // bloom
+  let sl=u.misc.xy;
+  if(u.lightC.w>0.01){                                         // volumetric god rays from the surface
+    let dir=(sl-i.uv); var acc=vec3<f32>(0.0); var w=1.0;
+    for(var k=0;k<24;k=k+1){ let uv=i.uv+dir*(f32(k)/24.0)*0.9;
+      acc+=textureSample(hdr,samp,uv).rgb*w; w*=0.96; }
+    acc/=24.0; col += max(acc-0.4,vec3<f32>(0.0))*u.lightC.rgb*u.lightC.w*0.35;
+  }
+  // subtle green depth vignette
+  let r=distance(i.uv,vec2<f32>(0.5,0.5));
+  col *= 1.0 - r*r*0.25;
+  col=aces(col*1.22);
+  let dn=fract(sin(dot(i.pos.xy,vec2<f32>(12.9898,78.233)))*43758.5453)-0.5;
+  col += dn/48.0;                                          // stronger dither to break 8-bit fog banding
+  return vec4<f32>(col,1.0);
+}`;
+
+// ---------------------------------------------------------------------------
+// Pipelines
+// ---------------------------------------------------------------------------
+const skyMod=device.createShaderModule({code:skyWGSL});
+const meshMod=device.createShaderModule({code:meshWGSL});
+const spriteMod=device.createShaderModule({code:spriteWGSL});
+const bloomMod=device.createShaderModule({code:bloomWGSL});
+const postMod=device.createShaderModule({code:postWGSL});
+
+const meshVbLayout={arrayStride:24,attributes:[
+  {shaderLocation:0,offset:0,format:'float32x3'},{shaderLocation:1,offset:12,format:'float32x3'}]};
+const meshInstLayout={arrayStride:48,stepMode:'instance',attributes:[
+  {shaderLocation:2,offset:0,format:'float32x4'},{shaderLocation:3,offset:16,format:'float32x4'},{shaderLocation:4,offset:32,format:'float32x4'}]};
+const spriteVbLayout={arrayStride:16,attributes:[
+  {shaderLocation:0,offset:0,format:'float32x2'},{shaderLocation:1,offset:8,format:'float32x2'}]};
+const spriteInstLayout={arrayStride:48,stepMode:'instance',attributes:[
+  {shaderLocation:2,offset:0,format:'float32x4'},{shaderLocation:3,offset:16,format:'float32x4'},{shaderLocation:4,offset:32,format:'float32x4'}]};
+
+const sceneBGL=device.createBindGroupLayout({entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{}}]});
+const sceneBG=device.createBindGroup({layout:sceneBGL,entries:[{binding:0,resource:{buffer:uBuf}}]});
+const scenePL=device.createPipelineLayout({bindGroupLayouts:[sceneBGL]});
+
+const skyPipe=device.createRenderPipeline({layout:scenePL,
+  vertex:{module:skyMod,entryPoint:'vs'}, fragment:{module:skyMod,entryPoint:'fs',targets:[{format:HDR}]},
+  primitive:{topology:'triangle-list'}, multisample:{count:SAMPLES},
+  depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'always'}});
+const meshPipe=device.createRenderPipeline({layout:scenePL,
+  vertex:{module:meshMod,entryPoint:'vs',buffers:[meshVbLayout,meshInstLayout]},
+  fragment:{module:meshMod,entryPoint:'fs',targets:[{format:HDR}]},
+  primitive:{topology:'triangle-list',cullMode:'none'}, multisample:{count:SAMPLES},
+  depthStencil:{format:'depth24plus',depthWriteEnabled:true,depthCompare:'less'}});
+const spritePipe=device.createRenderPipeline({layout:scenePL,
+  vertex:{module:spriteMod,entryPoint:'vs',buffers:[spriteVbLayout,spriteInstLayout]},
+  fragment:{module:spriteMod,entryPoint:'fs',targets:[{format:HDR,blend:{
+    color:{srcFactor:'src-alpha',dstFactor:'one',operation:'add'},alpha:{srcFactor:'zero',dstFactor:'one',operation:'add'}}}]},
+  primitive:{topology:'triangle-list',cullMode:'none'}, multisample:{count:SAMPLES},
+  depthStencil:{format:'depth24plus',depthWriteEnabled:false,depthCompare:'less'}});
+
+const bloomBGL=device.createBindGroupLayout({entries:[
+  {binding:0,visibility:GPUShaderStage.FRAGMENT,sampler:{}},{binding:1,visibility:GPUShaderStage.FRAGMENT,texture:{}}]});
+const bloomPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[bloomBGL]}),
+  vertex:{module:bloomMod,entryPoint:'vs'}, fragment:{module:bloomMod,entryPoint:'fs',targets:[{format:HDR}]},
+  primitive:{topology:'triangle-list'}});
+const postBGL=device.createBindGroupLayout({entries:[
+  {binding:0,visibility:GPUShaderStage.FRAGMENT,buffer:{}},
+  {binding:1,visibility:GPUShaderStage.FRAGMENT,sampler:{}},
+  {binding:2,visibility:GPUShaderStage.FRAGMENT,texture:{}},
+  {binding:3,visibility:GPUShaderStage.FRAGMENT,texture:{}}]});
+const postPipe=device.createRenderPipeline({layout:device.createPipelineLayout({bindGroupLayouts:[postBGL]}),
+  vertex:{module:postMod,entryPoint:'vs'}, fragment:{module:postMod,entryPoint:'fs',targets:[{format}]},
+  primitive:{topology:'triangle-list'}});
+const samp=device.createSampler({magFilter:'linear',minFilter:'linear'});
+
+// ---------------------------------------------------------------------------
+// Resize-managed targets + preallocated pass descriptors
+// ---------------------------------------------------------------------------
+let hdrMS=null,hdrRes=null,depthMS=null,bloomTex=null,hdrResView=null,bloomView=null,postBG=null,bloomBG=null,W=0,H=0;
+const texPool=[];
+const scenePass={colorAttachments:[{view:null,resolveTarget:null,clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}],
+  depthStencilAttachment:{view:null,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}};
+const bloomPass={colorAttachments:[{view:null,clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]};
+const postPass={colorAttachments:[{view:null,clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]};
+
+let tsQuery=null,tsBuf=null,tsRead=null,tsBusy=false;
+if(canTS){ try{
+  tsQuery=device.createQuerySet({type:'timestamp',count:2});
+  tsBuf=device.createBuffer({size:16,usage:GPUBufferUsage.QUERY_RESOLVE|GPUBufferUsage.COPY_SRC});
+  tsRead=device.createBuffer({size:16,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+}catch(e){ tsQuery=null; } }
+
+function resize(){
+  const dpr=Math.min(devicePixelRatio||1, 2);
+  const w=Math.max(1,(canvas.clientWidth*dpr)|0), h=Math.max(1,(canvas.clientHeight*dpr)|0);
+  if(w===W&&h===H) return; W=w;H=h; canvas.width=w; canvas.height=h;
+  const rw=Math.max(1,Math.round(w*SS)), rh=Math.max(1,Math.round(h*SS));
+  while(texPool.length) texPool.pop().destroy();
+  hdrMS=device.createTexture({size:[rw,rh],sampleCount:SAMPLES,format:HDR,usage:GPUTextureUsage.RENDER_ATTACHMENT}); texPool.push(hdrMS);
+  hdrRes=device.createTexture({size:[rw,rh],format:HDR,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}); texPool.push(hdrRes);
+  depthMS=device.createTexture({size:[rw,rh],sampleCount:SAMPLES,format:'depth24plus',usage:GPUTextureUsage.RENDER_ATTACHMENT}); texPool.push(depthMS);
+  const bw=Math.max(1,rw>>1),bh=Math.max(1,rh>>1);
+  bloomTex=device.createTexture({size:[bw,bh],format:HDR,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}); texPool.push(bloomTex);
+  hdrResView=hdrRes.createView(); bloomView=bloomTex.createView();
+  scenePass.colorAttachments[0].view=hdrMS.createView();
+  scenePass.colorAttachments[0].resolveTarget=hdrResView;
+  scenePass.depthStencilAttachment.view=depthMS.createView();
+  bloomPass.colorAttachments[0].view=bloomView;
+  bloomBG=device.createBindGroup({layout:bloomBGL,entries:[{binding:0,resource:samp},{binding:1,resource:hdrResView}]});
+  postBG=device.createBindGroup({layout:postBGL,entries:[
+    {binding:0,resource:{buffer:uBuf}},{binding:1,resource:samp},{binding:2,resource:hdrResView},{binding:3,resource:bloomView}]});
+}
+window.addEventListener('resize',resize); resize();
+
+// ---------------------------------------------------------------------------
+// Camera + controls
+// ---------------------------------------------------------------------------
+const cam={x:12,y:16,z:56,yaw:-0.15,pitch:0.07};
+const keys=Object.create(null);
+addEventListener('keydown',e=>{keys[e.code]=true;});
+addEventListener('keyup',e=>{keys[e.code]=false;});
+canvas.addEventListener('click',()=>{ if(POSE<0&&!FLYTHROUGH) canvas.requestPointerLock(); });
+addEventListener('mousemove',e=>{ if(document.pointerLockElement===canvas){
+  cam.yaw+=e.movementX*0.0022; cam.pitch-=e.movementY*0.0022;
+  cam.pitch=Math.max(-1.5,Math.min(1.5,cam.pitch)); }});
+
+// Building collision (free-fly only): keep camera above seabed and out of tower footprints.
+const CMARGIN=2.0, CFLOOR=1.5;
+function resolveCollision(){
+  if(cam.y<CFLOOR) cam.y=CFLOOR;
+  for(let i=0;i<buildings.length;i++){
+    const b=buildings[i]; const hw=b[3]+CMARGIN;
+    const dx=cam.x-b[0], dz=cam.z-b[2];
+    if(dx>-hw&&dx<hw&&dz>-hw&&dz<hw&&cam.y<b[1]*2+CMARGIN){
+      const px=hw-Math.abs(dx), pz=hw-Math.abs(dz);
+      if(px<pz){ cam.x=b[0]+(dx>=0?hw:-hw); } else { cam.z=b[2]+(dz>=0?hw:-hw); }
+    }
+  }
+}
+
+const POSES=new Float32Array([
+  10,19, 56, -0.12, 0.13,        // 0 establishing: look up at the snapped hero tower
+  40,16, 40, -0.7,-0.06,        // 1 down a side canyon between leaning towers
+  34,13, 46,  0.0,-0.08,        // 2 close on the coral obelisk monument
+   0,20,110,  0.0,-0.02,        // 3 fish school snaking down the central canyon
+  20,26, 70, -0.2,-0.30,        // 4 backlit god rays from the surface
+ -38,24, 10, -0.42,-0.34 ]);     // 5 the collapsed stadium amphitheater lagoon
+const FP=new Float32Array([   // canyon-lane spline (central, tower-free lanes, higher glide)
+   0,27,90,  10,29,46,  38,31,24,  48,29,-24,  25,33,-58,  0,27,-60,
+  -26,31,-24,  -46,29,18,  -26,33,46,  0,29,60,  0,27,74,  0,27,90]);
+const FPN=FP.length/3;
+function catmull(out,arr,n,tt){ const f=tt*n, i=Math.floor(f), fr=f-i;
+  const i0=(i-1+n)%n,i1=i%n,i2=(i+1)%n,i3=(i+2)%n;
+  for(let c=0;c<3;c++){ const p0=arr[i0*3+c],p1=arr[i1*3+c],p2=arr[i2*3+c],p3=arr[i3*3+c];
+    out[c]=0.5*((2*p1)+(-p0+p2)*fr+(2*p0-5*p1+4*p2-p3)*fr*fr+(-p0+3*p1-3*p2+p3)*fr*fr*fr); } }
+const fpOut=new Float32Array(3), fpLook=new Float32Array(3);
+
+// ---------------------------------------------------------------------------
+// Perf logging (preallocated ring buffer)
+// ---------------------------------------------------------------------------
+const LOGN=4096; const cpuLog=new Float32Array(LOGN); const gpuLog=new Float32Array(LOGN);
+let logI=0, logCount=0, lastGpuMs=0;
+function pushLog(cpuMs,gpuMs){ cpuLog[logI]=cpuMs; gpuLog[logI]=gpuMs; logI=(logI+1)%LOGN; if(logCount<LOGN)logCount++; }
+const sortScratch=new Float32Array(LOGN);
+function stats(src){ const n=logCount; if(n===0)return{avg:0,p99:0,max:0,count:0};
+  let sum=0,mx=0; for(let k=0;k<n;k++){ const v=src[k]; sum+=v; if(v>mx)mx=v; sortScratch[k]=v; }
+  const sub=sortScratch.subarray(0,n); sub.sort(); return {avg:sum/n, p99:sub[Math.min(n-1,Math.floor(n*0.99))], max:mx, count:n}; }
+window.__frameLog=cpuLog;
+window.__perf=function(){ const g=stats(gpuLog), c=stats(cpuLog); const useGpu=lastGpuMs>0; const r=useGpu?g:c;
+  return {avg:+r.avg.toFixed(3),p99:+r.p99.toFixed(3),max:+r.max.toFixed(3),count:r.count,source:useGpu?'gpu':'cpu'}; };
+window.__ready=false;
+window.__cam=cam;
+window.__collideTest=(bx,bz,by)=>{ cam.x=bx; cam.y=(by===undefined?5:by); cam.z=bz; resolveCollision(); return {x:cam.x,y:cam.y,z:cam.z}; };
+window.__firstBuilding=()=>{ const b=buildings[0]; return {x:b[0],y:b[1],z:b[2],hw:b[3]}; };
+const submitArr=[null]; let pendingCpuMs=0;
+function onTS(){ const a=new BigInt64Array(tsRead.getMappedRange()); const g=Number(a[1]-a[0])/1e6;
+  tsRead.unmap(); tsBusy=false; if(g>0&&g<100){ lastGpuMs=g; } pushLog(pendingCpuMs,lastGpuMs); }
+
+// ---------------------------------------------------------------------------
+// Frame loop
+// ---------------------------------------------------------------------------
+const T0=performance.now(); let prev=T0; let frames=0; let hudT=0;
+msg.textContent='';
+function frame(now){
+  const dt=Math.min(0.05,(now-prev)/1000); prev=now; const t=(now-T0)/1000;
+  resize();
+  if(CALIB){ cam.x=0;cam.y=150;cam.z=120;cam.yaw=0;cam.pitch=0; }
+  else if(FLYTHROUGH){
+    const tt=(t%60)/60; catmull(fpOut,FP,FPN,tt); catmull(fpLook,FP,FPN,(tt+0.015)%1);
+    cam.x=fpOut[0];cam.y=fpOut[1];cam.z=fpOut[2];
+    const dx=fpLook[0]-cam.x,dy=fpLook[1]-cam.y,dz=fpLook[2]-cam.z;
+    cam.yaw=Math.atan2(dx,-dz); cam.pitch=Math.atan2(dy,Math.hypot(dx,dz));
+  } else if(POSE>=0){ const b=POSE*5; cam.x=POSES[b];cam.y=POSES[b+1];cam.z=POSES[b+2];cam.yaw=POSES[b+3];cam.pitch=POSES[b+4];
+  } else {
+    const sp=(keys['ShiftLeft']||keys['ShiftRight']?52:18)*dt;
+    const cy=Math.cos(cam.yaw),sy=Math.sin(cam.yaw);
+    if(keys['KeyW']){cam.x+=sy*sp*Math.cos(cam.pitch);cam.y+=Math.sin(cam.pitch)*sp;cam.z-=cy*sp*Math.cos(cam.pitch);}
+    if(keys['KeyS']){cam.x-=sy*sp*Math.cos(cam.pitch);cam.y-=Math.sin(cam.pitch)*sp;cam.z+=cy*sp*Math.cos(cam.pitch);}
+    if(keys['KeyA']){cam.x-=cy*sp;cam.z-=sy*sp;}
+    if(keys['KeyD']){cam.x+=cy*sp;cam.z+=sy*sp;}
+    if(keys['KeyE']){cam.y+=sp;} if(keys['KeyQ']){cam.y-=sp;}
+    resolveCollision();
+  }
+  perspective(mProj, 1.08, W/H, 0.5, 1000);
+  viewFrom(cam.x,cam.y,cam.z,cam.yaw,cam.pitch);
+  mul(mVP,mProj,mView);
+  if(CALIB){                                           // markers 26u ahead: green up, red down, yellow +X right
+    const fx=cam.x+vF[0]*26, fy=cam.y+vF[1]*26, fz=cam.z+vF[2]*26;
+    markerScratch[0]=fx;markerScratch[1]=fy+8;markerScratch[2]=fz;markerScratch[3]=2.5; markerScratch[4]=0;markerScratch[5]=1;markerScratch[6]=0;markerScratch[7]=0; markerScratch[8]=0;markerScratch[9]=7;markerScratch[10]=1;markerScratch[11]=0;
+    markerScratch[12]=fx;markerScratch[13]=fy-8;markerScratch[14]=fz;markerScratch[15]=2.5; markerScratch[16]=1;markerScratch[17]=0;markerScratch[18]=0;markerScratch[19]=0; markerScratch[20]=0;markerScratch[21]=7;markerScratch[22]=1;markerScratch[23]=0;
+    markerScratch[24]=fx+10;markerScratch[25]=fy;markerScratch[26]=fz;markerScratch[27]=2.5; markerScratch[28]=1;markerScratch[29]=1;markerScratch[30]=0;markerScratch[31]=0; markerScratch[32]=0;markerScratch[33]=7;markerScratch[34]=1;markerScratch[35]=0;
+    device.queue.writeBuffer(markerBuf,0,markerScratch);
+  }
+  for(let k=0;k<16;k++)U[k]=mVP[k];
+  U[16]=cam.x;U[17]=cam.y;U[18]=cam.z;U[19]=t;
+  U[20]=vR[0];U[21]=vR[1];U[22]=vR[2];U[23]=0;
+  U[24]=vU[0];U[25]=vU[1];U[26]=vU[2];U[27]=0;
+  U[28]=0.11;U[29]=0.36;U[30]=0.22;U[31]=0.015;          // fogNear acid toxic-green, density
+  U[32]=0.03;U[33]=0.10;U[34]=0.07;U[35]=130;            // fogFar green-black murk, maxdist (hides world bounds)
+  U[36]=40;U[37]=240;U[38]=-30;U[39]=1.0;                 // key light high above (surface sun)
+  U[40]=0.55;U[41]=1.0;U[42]=0.65;U[43]=NO_VOL?0.0:0.26;  // sickly green-white light, godray strength (subtle)
+  const lx=U[36],ly=U[37],lz=U[38];
+  const cx=mVP[0]*lx+mVP[4]*ly+mVP[8]*lz+mVP[12];
+  const cyp=mVP[1]*lx+mVP[5]*ly+mVP[9]*lz+mVP[13];
+  const cw=mVP[3]*lx+mVP[7]*ly+mVP[11]*lz+mVP[15];
+  U[44]=cw>0?(cx/cw*0.5+0.5):-1; U[45]=cw>0?(1.0-(cyp/cw*0.5+0.5)):-1; U[46]=W/H; U[47]=FLYTHROUGH?1:0;
+  if(cw<=0){ U[43]=0; }
+  device.queue.writeBuffer(uBuf,0,U,0,48);
+
+  postPass.colorAttachments[0].view=ctx.getCurrentTexture().createView();
+  const useTS = tsQuery && !tsBusy;
+  if(useTS){ scenePass.timestampWrites={querySet:tsQuery,beginningOfPassWriteIndex:0,endOfPassWriteIndex:1}; }
+  else { scenePass.timestampWrites=undefined; }
+  const enc=device.createCommandEncoder();
+  const rp=enc.beginRenderPass(scenePass);
+  rp.setBindGroup(0,sceneBG);
+  rp.setPipeline(skyPipe); rp.draw(3);                    // underwater backdrop first
+  rp.setPipeline(meshPipe);
+  rp.setVertexBuffer(0,plane.vb); rp.setVertexBuffer(1,groundInst); rp.setIndexBuffer(plane.ib,plane.fmt); rp.drawIndexed(plane.count,1);
+  rp.setVertexBuffer(0,cube.vb); rp.setIndexBuffer(cube.ib,cube.fmt);
+  rp.setVertexBuffer(1,bBuf); rp.drawIndexed(cube.count,bCount);
+  rp.setVertexBuffer(1,debBuf); rp.drawIndexed(cube.count,debCount);
+  if(!NO_FLOCK){ rp.setVertexBuffer(1,fBuf); rp.drawIndexed(cube.count,fCount); }
+  rp.setVertexBuffer(0,coralMesh.vb); rp.setVertexBuffer(1,coralBuf); rp.setIndexBuffer(coralMesh.ib,coralMesh.fmt); rp.drawIndexed(coralMesh.count,coralCount);
+  rp.setVertexBuffer(1,statueInst); rp.drawIndexed(coralMesh.count,1);
+  rp.setVertexBuffer(0,dome.vb); rp.setVertexBuffer(1,domeInst); rp.setIndexBuffer(dome.ib,dome.fmt); rp.drawIndexed(dome.count,1);
+  if(!NO_HERO){ rp.setVertexBuffer(0,manta.vb); rp.setVertexBuffer(1,heroInst); rp.setIndexBuffer(manta.ib,manta.fmt); rp.drawIndexed(manta.count,1); }
+  if(CALIB){ rp.setVertexBuffer(0,cube.vb); rp.setVertexBuffer(1,markerBuf); rp.setIndexBuffer(cube.ib,cube.fmt); rp.drawIndexed(cube.count,3); }
+  rp.setPipeline(spritePipe);
+  rp.setVertexBuffer(0,quadVB); rp.setIndexBuffer(quadIB,'uint16');
+  if(!NO_VEG){ rp.setVertexBuffer(1,kelpBuf); rp.drawIndexed(6,kelpCount); }
+  rp.setVertexBuffer(1,jellyBuf); rp.drawIndexed(6,jellyCount);
+  if(snowBuf){ rp.setVertexBuffer(1,snowBuf); rp.drawIndexed(6,snowCount); }
+  if(bubBuf){ rp.setVertexBuffer(1,bubBuf); rp.drawIndexed(6,bubCount); }
+  if(sporeBuf){ rp.setVertexBuffer(1,sporeBuf); rp.drawIndexed(6,sporeCount); }
+  rp.end();
+  const bp=enc.beginRenderPass(bloomPass); bp.setPipeline(bloomPipe); bp.setBindGroup(0,bloomBG); bp.draw(3); bp.end();
+  const pp=enc.beginRenderPass(postPass); pp.setPipeline(postPipe); pp.setBindGroup(0,postBG); pp.draw(3); pp.end();
+  if(useTS){ enc.resolveQuerySet(tsQuery,0,2,tsBuf,0); enc.copyBufferToBuffer(tsBuf,0,tsRead,0,16); }
+  submitArr[0]=enc.finish(); device.queue.submit(submitArr);
+
+  const cpuMs=performance.now()-now;
+  if(useTS){ tsBusy=true; pendingCpuMs=cpuMs; tsRead.mapAsync(GPUMapMode.READ).then(onTS); }
+  else { pushLog(cpuMs, lastGpuMs); }
+
+  frames++;
+  if(now-hudT>250){ hudT=now; const p=window.__perf();
+    hud.textContent=`${(frames/((now-T0)/1000)).toFixed(0)} fps · ${p.source} avg ${p.avg} / p99 ${p.p99} / max ${p.max} ms`
+      +`\n${W}×${H}${FLYTHROUGH?' · FLYTHROUGH':''}${POSE>=0?' · POSE '+POSE:''}`; }
+  if(!window.__ready && frames>3){ window.__ready=true; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
