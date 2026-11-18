@@ -66,6 +66,22 @@ Metrópolis submarina muerta reconquistada por coral neón. Resultados de verifi
   tapaban el canvas e impedían el pointer-lock → corregido y codificado como check P0.
 - Nueva convención: **una carpeta por escena**. Nuevo **deliverable de video** (vertical/horizontal).
 
+### Sesión 3 — Mansión embrujada gótica *(Haunted Mansion)* · archivada acá
+Test de punta a punta de las skills **recién actualizadas** (levers de *fidelidad = compromiso +
+especificidad temática*, con techo que escala con los ciclos). Tema: decadencia Poe + pavor
+lovecraftiano. Resultados: **Gate 0 PASS** (atrapó bugs reales: frames negros por readback de
+GPU-timestamps a un buffer con `mapAsync` pendiente, y una luna inexistente como geometría),
+**Gate 2 no verificable** en la máquina (iGPU Intel, no la RTX del TARGET).
+
+**Hallazgo clave — el *plateau de primitivas*:** es la **primera escena que NO cruza el Gate 1**.
+Convergió en todo lo atmosférico (se cerraron niebla lechosa, sobreexposición, aliasing de sombras;
+sin god-rays difusos ni specular plástico), pero 5 critics aislados coinciden en que los **hero
+elements** (rosetón, retratos, murciélagos, llamas) hechos con quads/discos/cuñas se leen como
+"primitivas temáticas". Los scores **rebotan** (especificidad 4→3→5→3→4), señal de que cruzar el
+gate exige **cambio estructural** (mallas de tracería/bustos/criaturas reales), no parche cosmético.
+Expone el techo del enfoque "todo procedural a mano" para sujetos sensibles (rostros, tracería).
+Ver el postmortem completo en la carpeta de la escena.
+
 ---
 
 ## Galería
@@ -73,6 +89,7 @@ Metrópolis submarina muerta reconquistada por coral neón. Resultados de verifi
 | Escena | Carpeta | Estado |
 |---|---|---|
 | Sunken City | [`scenes/2026-11-16-sunken-city/`](scenes/2026-11-16-sunken-city/) | Gate 0 ✅ · Critic convergido · Gate 2 ✅ (4.9 ms avg) |
+| Haunted Mansion | [`scenes/2026-11-17-haunted-mansion/`](scenes/2026-11-17-haunted-mansion/) | Gate 0 ✅ · Critic **no convergió** (plateau de primitivas) · Gate 2 no verificable (iGPU) |
 
 ---
 

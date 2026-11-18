@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Haunted Mansion — WebGPU procedural scene</title>
+<style>
+html,body{margin:0;height:100%;background:#05060a;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace}
+#c{position:fixed;inset:0;width:100vw;height:100vh;display:block}
+/* Overlays MUST be pointer-events:none or they eat the click and pointer-lock never fires */
+#hud{position:fixed;left:10px;top:8px;color:#d9c7a0;font-size:12px;line-height:1.5;
+text-shadow:0 1px 2px #000;pointer-events:none;white-space:pre;opacity:.85}
+#msg{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+color:#cdb98f;font-size:15px;text-align:center;pointer-events:none;padding:24px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="msg"></div>
+<script type="module">
+"use strict";
+// ------------------------------------------------------------------ query flags
+const Q = new URLSearchParams(location.search);
+const POSE = Q.has('pose') ? Math.max(0, Math.min(5, parseInt(Q.get('pose'), 10) || 0)) : -1;
+const FLY = Q.get('flythrough') === '1';
+const CALIB = Q.get('calib') === '1';
+const NO_FLOCK = Q.get('noFlock') === '1';
+const NO_RAIN = Q.get('noRain') === '1';          // dust motes
+const NO_VOL = Q.get('noVolumetrics') === '1';    // god rays
+const CAPTURE = POSE >= 0 || FLY || CALIB;
+const hud = document.getElementById('hud');
+const msg = document.getElementById('msg');
+if (CAPTURE) { hud.style.display = 'none'; msg.style.display = 'none'; }
+function fail(t){ msg.style.display='flex'; msg.textContent = t; console.error(t); }
+// ------------------------------------------------------------------ math (column-major, zero per-frame alloc via scratch)
+function mIdent(o){ o.fill(0); o[0]=o[5]=o[10]=o[15]=1; return o; }
+function mMul(o,a,b){
+for(let c=0;c<4;c++){ const bc=c*4, b0=b[bc],b1=b[bc+1],b2=b[bc+2],b3=b[bc+3];
+o[bc]   = a[0]*b0+a[4]*b1+a[8]*b2+a[12]*b3;
+o[bc+1] = a[1]*b0+a[5]*b1+a[9]*b2+a[13]*b3;
+o[bc+2] = a[2]*b0+a[6]*b1+a[10]*b2+a[14]*b3;
+o[bc+3] = a[3]*b0+a[7]*b1+a[11]*b2+a[15]*b3;
+} return o;
+}
+function mPerspZO(o,fovy,aspect,near,far){ o.fill(0);
+const f=1/Math.tan(fovy/2); o[0]=f/aspect; o[5]=f; o[10]=far/(near-far); o[11]=-1; o[14]=(far*near)/(near-far); return o;
+}
+function mOrthoZO(o,l,r,b,t,n,f){ o.fill(0);
+const lr=1/(l-r), bt=1/(b-t), nf=1/(n-f);
+o[0]=-2*lr; o[5]=-2*bt; o[10]=nf; o[12]=(l+r)*lr; o[13]=(t+b)*bt; o[14]=n*nf; o[15]=1; return o;
+}
+const _z=new Float32Array(3), _x=new Float32Array(3), _y=new Float32Array(3);
+function mLookAt(o,ex,ey,ez,cx,cy,cz,ux,uy,uz){
+let zx=ex-cx, zy=ey-cy, zz=ez-cz; let rl=1/Math.hypot(zx,zy,zz); zx*=rl;zy*=rl;zz*=rl;
+let xx=uy*zz-uz*zy, xy=uz*zx-ux*zz, xz=ux*zy-uy*zx; rl=1/(Math.hypot(xx,xy,xz)||1); xx*=rl;xy*=rl;xz*=rl;
+const yx=zy*xz-zz*xy, yy=zz*xx-zx*xz, yz=zx*xy-zy*xx;
+o[0]=xx;o[1]=yx;o[2]=zx;o[3]=0; o[4]=xy;o[5]=yy;o[6]=zy;o[7]=0; o[8]=xz;o[9]=yz;o[10]=zz;o[11]=0;
+o[12]=-(xx*ex+xy*ey+xz*ez); o[13]=-(yx*ex+yy*ey+yz*ez); o[14]=-(zx*ex+zy*ey+zz*ez); o[15]=1; return o;
+}
+// ------------------------------------------------------------------ procedural geometry (built once at init)
+const VP=[], VN=[], VC=[], VM=[], IDX=[];           // position, normal, color, material, index arrays
+let vcount=0;
+function pushV(px,py,pz,nx,ny,nz,r,g,b,m){ VP.push(px,py,pz); VN.push(nx,ny,nz); VC.push(r,g,b); VM.push(m); return vcount++; }
+function tri(a,b,c){ IDX.push(a,b,c); }
+function quad(p0,p1,p2,p3,nx,ny,nz,r,g,b,m){
+const a=pushV(p0[0],p0[1],p0[2],nx,ny,nz,r,g,b,m);
+const d=pushV(p1[0],p1[1],p1[2],nx,ny,nz,r,g,b,m);
+const e=pushV(p2[0],p2[1],p2[2],nx,ny,nz,r,g,b,m);
+const f=pushV(p3[0],p3[1],p3[2],nx,ny,nz,r,g,b,m);
+tri(a,d,e); tri(a,e,f);
+}
+function box(cx,cy,cz,sx,sy,sz,r,g,b,m){
+const x0=cx-sx/2,x1=cx+sx/2,y0=cy-sy/2,y1=cy+sy/2,z0=cz-sz/2,z1=cz+sz/2;
+quad([x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1], 0,0,1, r,g,b,m);   // +z
+quad([x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0], 0,0,-1, r,g,b,m);  // -z
+quad([x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1], 1,0,0, r,g,b,m);   // +x
+quad([x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0], -1,0,0, r,g,b,m);  // -x
+quad([x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0], 0,1,0, r,g,b,m);   // +y
+quad([x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1], 0,-1,0, r,g,b,m);  // -y
+}
+// rotated thin beam (for pointed arches / balustrades) around Z at angle
+function beam(cx,cy,cz,len,thick,ang,r,g,b,m){
+const ca=Math.cos(ang), sa=Math.sin(ang), hl=len/2, ht=thick/2, hd=thick/2;
+const corners=[[-hl,-ht],[hl,-ht],[hl,ht],[-hl,ht]];
+const rot=corners.map(([lx,ly])=>[cx+lx*ca-ly*sa, cy+lx*sa+ly*ca]);
+quad([rot[0][0],rot[0][1],cz+hd],[rot[1][0],rot[1][1],cz+hd],[rot[2][0],rot[2][1],cz+hd],[rot[3][0],rot[3][1],cz+hd],0,0,1,r,g,b,m);
+quad([rot[1][0],rot[1][1],cz-hd],[rot[0][0],rot[0][1],cz-hd],[rot[3][0],rot[3][1],cz-hd],[rot[2][0],rot[2][1],cz-hd],0,0,-1,r,g,b,m);
+// thin sides (approx, small)
+box(cx,cy,cz,0.001,0.001,thick, r,g,b,m); // keeps bounds; cheap filler
+}
+function cylinder(cx,cz,y0,y1,rad,seg,r,g,b,m){
+const top=[],bot=[];
+for(let i=0;i<seg;i++){ const a=i/seg*Math.PI*2, px=cx+Math.cos(a)*rad, pz=cz+Math.sin(a)*rad;
+bot.push(pushV(px,y0,pz,Math.cos(a),0,Math.sin(a),r,g,b,m));
+top.push(pushV(px,y1,pz,Math.cos(a),0,Math.sin(a),r,g,b,m)); }
+for(let i=0;i<seg;i++){ const j=(i+1)%seg; tri(bot[i],bot[j],top[j]); tri(bot[i],top[j],top[i]); }
+}
+function octa(cx,cy,cz,rx,ry,rz,r,g,b,m){ // crystal drop / gem — a diamond shape
+const t=pushV(cx,cy+ry,cz,0,1,0,r,g,b,m), bo=pushV(cx,cy-ry,cz,0,-1,0,r,g,b,m);
+const mid=[]; for(let i=0;i<4;i++){ const a=i/4*Math.PI*2; mid.push(pushV(cx+Math.cos(a)*rx,cy,cz+Math.sin(a)*rz,Math.cos(a),0.2,Math.sin(a),r,g,b,m)); }
+for(let i=0;i<4;i++){ const j=(i+1)%4; tri(t,mid[i],mid[j]); tri(bo,mid[j],mid[i]); }
+}
+function disc(cx,cy,cz,rad,seg,axis,r,g,b,m){ // flat disc facing +axis (0=x,1=y,2=z)
+const cen=pushV(cx,cy,cz, axis===0?1:0,axis===1?1:0,axis===2?1:0, r,g,b,m), rim=[];
+for(let i=0;i<seg;i++){ const a=i/seg*Math.PI*2, u=Math.cos(a)*rad, v=Math.sin(a)*rad;
+let px=cx,py=cy,pz=cz; if(axis===0){py+=u;pz+=v;} else if(axis===1){px+=u;pz+=v;} else {px+=u;py+=v;}
+rim.push(pushV(px,py,pz, axis===0?1:0,axis===1?1:0,axis===2?1:0, r,g,b,m)); }
+for(let i=0;i<seg;i++){ const j=(i+1)%seg; tri(cen,rim[i],rim[j]); }
+}
+// ---- Materials: 0 stone 1 wood 2 tarnished-gold 3 crystal 4 canvas 5 moss 6 fabric 7 marble 8 eye 9 candle
+const STONE=[0.26,0.25,0.24], WOOD=[0.17,0.10,0.06], GOLD=[0.5,0.38,0.14], CRYS=[0.7,0.78,0.9],
+MARBLE=[0.22,0.21,0.2], FAB=[0.22,0.05,0.06], MOSS=[0.12,0.3,0.18];
+// ---- Floor (marble)
+quad([-20,0,25],[20,0,25],[20,0,-25],[-20,0,-25],0,1,0, MARBLE[0],MARBLE[1],MARBLE[2],7);
+// ---- Ceiling (dark stone, high) with partial open feel
+quad([-20,28,-25],[20,28,-25],[20,28,25],[-20,28,25],0,-1,0, 0.10,0.10,0.11,0);
+// ---- Side walls (stone) with pilasters
+box(-20,14,0, 1.2,28,50, STONE[0],STONE[1],STONE[2],0);
+box( 20,14,0, 1.2,28,50, STONE[0],STONE[1],STONE[2],0);
+box(0,14,25, 40,28,1.2, STONE[0],STONE[1],STONE[2],0);          // near wall (behind start)
+// ---- Far wall (z=-25) with a tall central opening for the rose window
+box(-13.5,14,-25, 13,28,1.2, STONE[0],STONE[1],STONE[2],0);
+box( 13.5,14,-25, 13,28,1.2, STONE[0],STONE[1],STONE[2],0);
+box(0,25.5,-25, 14,5,1.2, STONE[0],STONE[1],STONE[2],0);        // lintel above window
+// ---- Broken rose window: radial gold tracery ring around the moon opening
+{
+const cy=16.5, cz=-24.6, R=6.2;
+for(let i=0;i<16;i++){ if(i===5||i===6||i===11) continue; // a few broken-out spokes
+const a=i/16*Math.PI*2; beam(Math.cos(a)*R*0.5, cy+Math.sin(a)*R*0.5, cz, R, 0.35, a, GOLD[0],GOLD[1],GOLD[2],2); }
+// outer ring segments
+for(let i=0;i<24;i++){ if(i%7===0) continue; const a=i/24*Math.PI*2;
+box(Math.cos(a)*R, cy+Math.sin(a)*R, cz, 0.6,0.6,0.5, GOLD[0]*0.8,GOLD[1]*0.8,GOLD[2]*0.8,2); }
+}
+// gothic rose window: TWO concentric glass rings divided by dark LEAD CAMES (kills the flat "pie-chart" read)
+{
+const P2=Math.PI*2, cy=16.5, cz=-24.75, Ri=2.5, Rm=4.2, R=6.0;
+const inner=[[0.16,0.05,0.06],[0.16,0.11,0.04]];     // muted wine / old gold (alternating)
+const outer=[[0.04,0.07,0.13],[0.10,0.05,0.12]];     // muted teal-blue / plum
+const C=i=>Math.cos(i), S=i=>Math.sin(i);
+for(let i=0;i<16;i++){ const a0=i/16*P2, a1=(i+1)/16*P2; const ci=inner[i%2], co=outer[(i+1)%2];
+quad([C(a0)*Ri,cy+S(a0)*Ri,cz],[C(a1)*Ri,cy+S(a1)*Ri,cz],[C(a1)*Rm,cy+S(a1)*Rm,cz],[C(a0)*Rm,cy+S(a0)*Rm,cz],0,0,1, ci[0],ci[1],ci[2],12);
+quad([C(a0)*Rm,cy+S(a0)*Rm,cz],[C(a1)*Rm,cy+S(a1)*Rm,cz],[C(a1)*R,cy+S(a1)*R,cz],[C(a0)*R,cy+S(a0)*R,cz],0,0,1, co[0],co[1],co[2],12); }
+// lead cames (dark) in front of the glass: radial mullions + two concentric rings
+const czc=cz+0.08, LEAD=[0.02,0.017,0.016];
+for(let i=0;i<16;i++){ const a=i/16*P2; beam(C(a)*((Ri+R)/2), cy+S(a)*((Ri+R)/2), czc, R-Ri+0.2, 0.28, a, LEAD[0],LEAD[1],LEAD[2],0); }
+for(let i=0;i<48;i++){ const a=i/48*P2;
+box(C(a)*Rm, cy+S(a)*Rm, czc, 0.32,0.32,0.14, LEAD[0],LEAD[1],LEAD[2],0);
+box(C(a)*Ri, cy+S(a)*Ri, czc, 0.28,0.28,0.14, LEAD[0],LEAD[1],LEAD[2],0); }
+// thick gold stone rim around the whole window
+for(let i=0;i<48;i++){ const a=i/48*P2; box(C(a)*R, cy+S(a)*R, czc, 0.5,0.5,0.4, GOLD[0]*0.7,GOLD[1]*0.7,GOLD[2]*0.7,2); }
+}
+// the sick, oversized pale moon behind the rose window (blazes through the central hole — god-ray source)
+disc(0,16.5,-26, 3.6, 32, 2, 0.80,0.87,0.73, 10);
+// ---- Gothic column galleries + pointed arches along both sides
+for(let side=-1;side<=1;side+=2){
+for(let k=0;k<5;k++){
+const z=-16+k*8, x=side*13;
+cylinder(x,z, 0,16, 0.9, 12, STONE[0]*1.05,STONE[1]*1.05,STONE[2]*1.05,0);   // shaft
+box(x,16.4,z, 2.2,0.8,2.2, STONE[0],STONE[1],STONE[2],0);                     // capital
+box(x,0.4,z, 2.4,0.8,2.4, STONE[0],STONE[1],STONE[2],0);                      // base
+if(k<4){ // pointed arch to next column
+const z2=z+8, mx=x, apexY=21;
+beam(mx - side*0, 18.5, (z+z2)/2 - 2, 7.5, 0.7, side*0.6, STONE[0],STONE[1],STONE[2],0);
+beam(mx - side*0, 18.5, (z+z2)/2 + 2, 7.5, 0.7, side*0.6, STONE[0],STONE[1],STONE[2],0);
+box(mx, apexY, (z+z2)/2, 1.2,1.2,5.2, STONE[0],STONE[1],STONE[2],0);
+}
+}
+}
+// candle emissive markers (warm point accents) — declared before the chandelier uses them
+const candleList=[];
+function pushCandle(x,y,z,inten){ candleList.push([x,y,z, inten!==undefined?inten:(y<3?1.7:0.9)]);
+box(x,y,z,0.18,0.5,0.18, 0.9,0.85,0.7,0); octa(x,y+0.45,z,0.14,0.3,0.14, 1.0,0.6,0.2, 9); }
+// ---- HERO 1: grand double staircase + colossal cracked crystal chandelier
+(function staircase(){
+const steps=14, sw=6, sh=0.65, sd=0.8;
+for(let s=0;s<steps;s++){
+const y=0.3+s*sh, z=-6 - s*sd;
+// left flight and right flight (double)
+box(-5, y, z, sw, sh, sd*1.6, MARBLE[0]*0.9,MARBLE[1]*0.9,MARBLE[2]*0.85,7);
+box( 5, y, z, sw, sh, sd*1.6, MARBLE[0]*0.9,MARBLE[1]*0.9,MARBLE[2]*0.85,7);
+// balustrade posts
+if(s%2===0){ box(-8, y+0.9, z, 0.3,1.8,0.3, WOOD[0],WOOD[1],WOOD[2],1); box(8, y+0.9, z, 0.3,1.8,0.3, WOOD[0],WOOD[1],WOOD[2],1); }
+}
+// landing
+box(0, 0.3+steps*sh, -6-steps*sd-1.5, 18, sh, 5, MARBLE[0]*0.9,MARBLE[1]*0.9,MARBLE[2]*0.85,7);
+// handrails (sloped wood beams)
+beam(-8,5.5,-11, 15,0.5, 0.52, WOOD[0],WOOD[1],WOOD[2],1);
+beam( 8,5.5,-11, 15,0.5, -0.52, WOOD[0],WOOD[1],WOOD[2],1);
+})();
+(function chandelier(){
+const cx=0, cy=20.5, cz=-9, R=3.4, tilt=0.12;  // slightly fallen -> tilt
+// chain
+box(cx,24,cz, 0.12,8,0.12, GOLD[0]*0.6,GOLD[1]*0.6,GOLD[2]*0.6,2);
+// ring (tilted) via segments
+for(let i=0;i<24;i++){ const a=i/24*Math.PI*2, px=cx+Math.cos(a)*R, pz=cz+Math.sin(a)*R, py=cy+Math.sin(a)*R*tilt;
+box(px,py,pz, 0.5,0.35,0.5, GOLD[0],GOLD[1],GOLD[2],2); }
+// arms + candle cups + crystal drops
+for(let i=0;i<12;i++){ const a=i/12*Math.PI*2, px=cx+Math.cos(a)*R, pz=cz+Math.sin(a)*R, py=cy+Math.sin(a)*R*tilt;
+box(px,py+0.6,pz, 0.25,1.2,0.25, GOLD[0],GOLD[1],GOLD[2],2);
+if(i!==4&&i!==9) pushCandle(px,py+1.4,pz);                   // some candles still burning
+octa(px,py-0.9,pz, 0.35,0.9,0.35, CRYS[0],CRYS[1],CRYS[2],3);  // crystal drop
+}
+// central crystal cluster (the showpiece)
+for(let i=0;i<10;i++){ const a=i/10*Math.PI*2, rr=1.3; octa(cx+Math.cos(a)*rr, cy-1.4+Math.sin(a*2)*0.4, cz+Math.sin(a)*rr, 0.45,1.3,0.45, CRYS[0],CRYS[1],CRYS[2],3); }
+octa(cx,cy-2.6,cz, 0.9,2.0,0.9, CRYS[0],CRYS[1],CRYS[2],3);
+})();
+// ---- HERO 2: haunted ancestor portrait gallery (left wall) with eyes that track the camera
+for(let p=0;p<5;p++){
+const z=-14+p*7, x=-19.3, big=(p===2);
+const w=big?4.4:2.8, h=big?5.6:3.6, cy=big?8:6;
+// gilt frame as 4 border bars (NOT a solid slab — a slab in front would occlude the canvas)
+box(x+0.34,cy+h/2+0.18,z, 0.12,0.34,w+0.7, GOLD[0],GOLD[1],GOLD[2],2);   // top
+box(x+0.34,cy-h/2-0.18,z, 0.12,0.34,w+0.7, GOLD[0],GOLD[1],GOLD[2],2);   // bottom
+box(x+0.34,cy,z-w/2-0.18, 0.12,h+0.7,0.34, GOLD[0],GOLD[1],GOLD[2],2);   // left
+box(x+0.34,cy,z+w/2+0.18, 0.12,h+0.7,0.34, GOLD[0],GOLD[1],GOLD[2],2);   // right
+// canvas (procedural ghostly face), faces +x into the room
+quad([x+0.3,cy-h/2,z+w/2],[x+0.3,cy-h/2,z-w/2],[x+0.3,cy+h/2,z-w/2],[x+0.3,cy+h/2,z+w/2],1,0,0, 0.32,0.26,0.18,4);
+// eyes + pupils (pupils=mat8 track camera in vertex shader)
+const ey=cy+h*0.12, es=big?0.42:0.28;
+for(const dz of [-1,1]){
+disc(x+0.33, ey, z+dz*es*1.6, es, 8, 0, 0.82,0.78,0.7, 11);       // eye white
+octa(x+0.36, ey, z+dz*es*1.6, es*0.45,es*0.45,es*0.45, 0.02,0.02,0.03, 8); // pupil (haunted glow)
+}
+// wall sconce to the SIDE of the portrait (raking light, doesn't blob the face) — a point light
+pushCandle(x+1.4, cy-0.3, z - w*0.5 - 0.7, big?2.1:1.6);
+box(x+1.2, cy-0.55, z - w*0.5 - 0.7, 0.4,0.22,0.4, GOLD[0],GOLD[1],GOLD[2],2);  // bracket
+}
+// ---- Grandfather clock (right wall, support landmark)
+(function clock(){
+const x=18.8, z=10;
+box(x,6,z, 1.0,12,3, WOOD[0]*1.2,WOOD[1]*1.2,WOOD[2]*1.2,1);    // case
+disc(x-0.55,9.5,z, 1.1, 16, 0, GOLD[0],GOLD[1],GOLD[2],2);       // face
+disc(x-0.6,9.5,z, 0.35,12,0, 0.9,0.5,0.15, 9);                   // faint lume center
+box(x-0.6,9.5,z, 0.1,1.6,0.14, 0.05,0.05,0.05,0);                // hand (stopped)
+box(x-0.6,9.5,z, 0.1,0.14,1.1, 0.05,0.05,0.05,0);
+box(x-0.5,4.5,z, 0.2,5,0.2, GOLD[0]*0.7,GOLD[1]*0.7,GOLD[2]*0.7,2); // pendulum rod
+disc(x-0.5,2.2,z, 0.7,14,0, GOLD[0],GOLD[1],GOLD[2],2);             // pendulum bob
+})();
+// ---- Bookshelves + books + moss (library / cabinet of curiosities) along back corners
+function bookshelf(x,z,face){
+box(x,7,z, 0.8,14,6, WOOD[0],WOOD[1],WOOD[2],1);
+for(let sh=0;sh<6;sh++){ const sy=2+sh*2.1;
+box(x,sy-0.1,z, 0.9,0.2,6, WOOD[0]*1.3,WOOD[1]*1.3,WOOD[2]*1.3,1);
+for(let b=0;b<14;b++){ const bz=z-2.7+b*0.4+ (b%3)*0.02;
+const hgt=1.3+((b*7+sh*3)%5)*0.12;
+const pal=[[0.3,0.08,0.06],[0.1,0.14,0.08],[0.08,0.08,0.16],[0.28,0.22,0.08],[0.12,0.07,0.1]];
+const cc=pal[(b+sh)%5];
+box(x+face*0.35,sy+hgt/2,bz, 0.28,hgt,0.34, cc[0],cc[1],cc[2],1); }
+}
+// moss creeping at the base
+for(let i=0;i<5;i++) box(x+face*0.3, 0.3, z-2.5+i*1.1, 0.4,0.5,0.6, MOSS[0],MOSS[1],MOSS[2],5);
+}
+bookshelf(-18.5,-20, 1); bookshelf(18.5,-20,-1); bookshelf(18.5,20,-1); bookshelf(-18.5,20,1);
+// curtains (dark red fabric) flanking the rose window
+box(-7.5,16,-24, 0.4,20,2.5, FAB[0],FAB[1],FAB[2],6);
+box( 7.5,16,-24, 0.4,20,2.5, FAB[0],FAB[1],FAB[2],6);
+// one floor candelabrum for foreground warmth near the atrium
+pushCandle(-6,0.8,6);
+// ---- upload mesh buffers
+const meshF32 = new Float32Array(vcount*10);
+for(let i=0;i<vcount;i++){ const o=i*10;
+meshF32[o]=VP[i*3]; meshF32[o+1]=VP[i*3+1]; meshF32[o+2]=VP[i*3+2];
+meshF32[o+3]=VN[i*3]; meshF32[o+4]=VN[i*3+1]; meshF32[o+5]=VN[i*3+2];
+meshF32[o+6]=VC[i*3]; meshF32[o+7]=VC[i*3+1]; meshF32[o+8]=VC[i*3+2];
+meshF32[o+9]=VM[i];
+}
+const idxU32 = new Uint32Array(IDX);
+// ---- calibration markers (built in world space in front of the fixed calib camera)
+const CALIB_POS=[0,10,10];
+const calibV=[];
+function cmarker(cx,cy,cz,r,g,b){ const s=0.9;
+// quad facing +z (toward camera which looks -z)
+calibV.push(cx-s,cy-s,cz,r,g,b, cx+s,cy-s,cz,r,g,b, cx-s,cy+s,cz,r,g,b,
+cx-s,cy+s,cz,r,g,b, cx+s,cy-s,cz,r,g,b, cx+s,cy+s,cz,r,g,b);
+}
+{ const bx=CALIB_POS[0], by=CALIB_POS[1], bz=CALIB_POS[2]-6;
+cmarker(bx, by+1.8, bz, 0,1,0);   // green = world +Y (up)
+cmarker(bx, by-1.8, bz, 1,0,0);   // red   = world -Y (down)
+cmarker(bx+1.8, by, bz, 1,1,0);   // yellow= world +X (right)
+}
+const calibF32 = new Float32Array(calibV);
+// ---- bat base mesh (body + 2 wings), layout pos(3) nrm(3) wing(1)
+const bV=[];
+function bv(x,y,z,nx,ny,nz,w){ bV.push(x,y,z,nx,ny,nz,w); }
+// body (elongated diamond along z)
+bv(0,0,0.5,0,0,1,0); bv(0.12,0,-0.1,1,0,0,0); bv(0,0.1,-0.1,0,1,0,0); // nose cluster (rough)
+function btri(a,b,c,nx,ny,nz,w){ const base=bV.length/7; bv(a[0],a[1],a[2],nx,ny,nz,w); bv(b[0],b[1],b[2],nx,ny,nz,w); bv(c[0],c[1],c[2],nx,ny,nz,w); }
+bV.length=0;
+// body fuselage
+btri([0,0,0.42],[0.09,0,-0.05],[0,0.07,-0.05],0,1,0,0);
+btri([0,0,0.42],[0,0.07,-0.05],[-0.09,0,-0.05],0,1,0,0);
+btri([0,0,-0.4],[0,0.07,-0.05],[0.09,0,-0.05],0,1,0,0);
+btri([0,0,-0.4],[-0.09,0,-0.05],[0,0.07,-0.05],0,1,0,0);
+// ears
+btri([0.05,0.06,0.3],[0.09,0.2,0.26],[0.02,0.06,0.24],0,0,1,0);
+btri([-0.05,0.06,0.3],[-0.02,0.06,0.24],[-0.09,0.2,0.26],0,0,1,0);
+// right wing — elbow bend + scalloped trailing edge
+btri([0.1,0,0.08],[0.62,0.03,-0.02],[0.1,0,-0.32],0,1,0,1);
+btri([0.1,0,-0.32],[0.62,0.03,-0.02],[0.5,0,-0.5],0,1,0,1);
+btri([0.62,0.03,-0.02],[1.25,0.0,-0.12],[0.5,0,-0.5],0,1,0,1);
+btri([0.5,0,-0.5],[1.25,0.0,-0.12],[0.95,0,-0.62],0,1,0,1);
+// left wing (mirror)
+btri([-0.1,0,0.08],[-0.1,0,-0.32],[-0.62,0.03,-0.02],0,1,0,1);
+btri([-0.1,0,-0.32],[-0.5,0,-0.5],[-0.62,0.03,-0.02],0,1,0,1);
+btri([-0.62,0.03,-0.02],[-0.5,0,-0.5],[-1.25,0.0,-0.12],0,1,0,1);
+btri([-0.5,0,-0.5],[-0.95,0,-0.62],[-1.25,0.0,-0.12],0,1,0,1);
+const batMeshF32 = new Float32Array(bV);
+const batVertCount = bV.length/7;
+// ---- bats flock state (CPU, preallocated — zero per-frame alloc)
+const NBAT = NO_FLOCK ? 0 : 110;
+const bPos = new Float32Array(NBAT*3), bVel = new Float32Array(NBAT*3), bPhase = new Float32Array(NBAT);
+const batInstF32 = new Float32Array(NBAT*7);
+for(let i=0;i<NBAT;i++){
+bPos[i*3]=(Math.random()-0.5)*24; bPos[i*3+1]=6+Math.random()*14; bPos[i*3+2]=(Math.random()-0.5)*36;
+bVel[i*3]=(Math.random()-0.5)*2; bVel[i*3+1]=(Math.random()-0.5)*1; bVel[i*3+2]=(Math.random()-0.5)*2;
+bPhase[i]=Math.random()*6.28;
+}
+function updateFlock(dt){
+const PR=4.0, PR2=PR*PR, maxS=6.0;
+for(let i=0;i<NBAT;i++){
+let ax=0,ay=0,az=0, cx=0,cy=0,cz=0, vx=0,vy=0,vz=0, n=0;
+const ix=bPos[i*3],iy=bPos[i*3+1],iz=bPos[i*3+2];
+for(let j=0;j<NBAT;j++){ if(j===i) continue;
+const dx=bPos[j*3]-ix, dy=bPos[j*3+1]-iy, dz=bPos[j*3+2]-iz, d2=dx*dx+dy*dy+dz*dz;
+if(d2<PR2 && d2>0.0001){ cx+=bPos[j*3];cy+=bPos[j*3+1];cz+=bPos[j*3+2]; vx+=bVel[j*3];vy+=bVel[j*3+1];vz+=bVel[j*3+2];
+const inv=1/d2; ax-=dx*inv; ay-=dy*inv; az-=dz*inv; n++; } }
+let fx=0,fy=0,fz=0;
+if(n>0){ cx=cx/n-ix; cy=cy/n-iy; cz=cz/n-iz; vx=vx/n; vy=vy/n; vz=vz/n;
+fx=cx*0.02+vx*0.05+ax*1.2; fy=cy*0.02+vy*0.05+ay*1.2; fz=cz*0.02+vz*0.05+az*1.2; }
+// steer back inside bounds
+if(ix<-17)fx+=2; if(ix>17)fx-=2; if(iy<4)fy+=2; if(iy>24)fy-=2; if(iz<-22)fz+=2; if(iz>22)fz-=2;
+let nvx=bVel[i*3]+fx*dt, nvy=bVel[i*3+1]+fy*dt, nvz=bVel[i*3+2]+fz*dt;
+const sp=Math.hypot(nvx,nvy,nvz)||1; if(sp>maxS){ const s=maxS/sp; nvx*=s;nvy*=s;nvz*=s; }
+bVel[i*3]=nvx;bVel[i*3+1]=nvy;bVel[i*3+2]=nvz;
+bPos[i*3]=ix+nvx*dt; bPos[i*3+1]=iy+nvy*dt; bPos[i*3+2]=iz+nvz*dt;
+const o=i*7; batInstF32[o]=bPos[i*3];batInstF32[o+1]=bPos[i*3+1];batInstF32[o+2]=bPos[i*3+2];
+const il=1/(Math.hypot(nvx,nvy,nvz)||1); batInstF32[o+3]=nvx*il;batInstF32[o+4]=nvy*il;batInstF32[o+5]=nvz*il;
+batInstF32[o+6]=bPhase[i];
+}
+}
+// ------------------------------------------------------------------ WebGPU boot
+if(!navigator.gpu){ fail('WebGPU no está disponible en este navegador. Usá Chrome/Edge 113+ con GPU.'); throw new Error('no webgpu'); }
+const canvas = document.getElementById('c');
+const adapter = await navigator.gpu.requestAdapter({ powerPreference:'high-performance' });
+if(!adapter){ fail('No se obtuvo adaptador WebGPU.'); throw new Error('no adapter'); }
+const hasTS = adapter.features.has('timestamp-query');
+const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
+const ctx = canvas.getContext('webgpu');
+const fmt = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device, format: fmt, alphaMode:'opaque' });
+let adapterName='desconocida'; try{ const info=adapter.info||await adapter.requestAdapterInfo?.(); if(info) adapterName=(info.description||info.vendor||'')+' '+(info.architecture||''); }catch(e){}
+// ---- GPU buffers
+function mkBuf(data,usage){ const b=device.createBuffer({size:data.byteLength,usage,mappedAtCreation:true});
+(data instanceof Float32Array?new Float32Array(b.getMappedRange()):new Uint32Array(b.getMappedRange())).set(data); b.unmap(); return b; }
+const meshVBO = mkBuf(meshF32, GPUBufferUsage.VERTEX);
+const meshIBO = mkBuf(idxU32, GPUBufferUsage.INDEX);
+const calibVBO = mkBuf(calibF32, GPUBufferUsage.VERTEX);
+const batVBO = mkBuf(batMeshF32, GPUBufferUsage.VERTEX);
+const batInstBuf = device.createBuffer({ size: Math.max(16,batInstF32.byteLength), usage: GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST });
+const UNIF_FLOATS=64;
+const uF32 = new Float32Array(UNIF_FLOATS);
+const uBuf = device.createBuffer({ size: UNIF_FLOATS*4, usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST });
+// candle point lights (static) — emissive geometry that actually illuminates its surroundings
+const MAXL=16; const lightsF32=new Float32Array(MAXL*4);
+for(let i=0;i<Math.min(MAXL,candleList.length);i++){ const c=candleList[i];
+lightsF32[i*4]=c[0]; lightsF32[i*4+1]=c[1]+0.4; lightsF32[i*4+2]=c[2];
+lightsF32[i*4+3]= c[3]; }
+const lightsBuf = mkBuf(lightsF32, GPUBufferUsage.UNIFORM);
+// ---- shadow map
+const SHADOW=4096;
+let shadowTex = device.createTexture({ size:[SHADOW,SHADOW], format:'depth32float', usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING });
+let shadowView = shadowTex.createView();
+const shadowSamp = device.createSampler({ compare:'less', magFilter:'linear', minFilter:'linear' });
+const linSamp = device.createSampler({ magFilter:'linear', minFilter:'linear' });
+// ---- WGSL --------------------------------------------------------
+const UNI_STRUCT = `struct Uni {
+viewProj: mat4x4f, lightVP: mat4x4f,
+camPosTime: vec4f, lightDirAmb: vec4f, fogNear: vec4f, fogFar: vec4f,
+camRightFlags: vec4f, camUpAspect: vec4f, moonGR: vec4f, keyCol: vec4f,
+};`;
+const SHADOW_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+@vertex fn vs(@location(0) p: vec3f) -> @builtin(position) vec4f {
+return uni.lightVP * vec4f(p,1.0);
+}`;
+const MAIN_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+@group(0) @binding(1) var shadowSamp: sampler_comparison;
+@group(0) @binding(2) var shadowTex: texture_depth_2d;
+@group(0) @binding(3) var<uniform> lights: array<vec4f,16>;
+struct VSOut {
+@builtin(position) pos: vec4f,
+@location(0) wpos: vec3f, @location(1) nrm: vec3f,
+@location(2) col: vec3f, @location(3) mat: f32, @location(4) lpos: vec3f,
+};
+@vertex fn vs(@location(0) p: vec3f,@location(1) n: vec3f,@location(2) c: vec3f,@location(3) m: f32)->VSOut{
+var o: VSOut; var wp=p;
+if(m>7.5 && m<8.5){ let tc=normalize(uni.camPosTime.xyz-p); wp=p+tc*0.03; } // pupils track camera
+o.wpos=wp; o.nrm=n; o.col=c; o.mat=m;
+o.pos=uni.viewProj*vec4f(wp,1.0);
+let lp=uni.lightVP*vec4f(wp,1.0); o.lpos=lp.xyz/lp.w;
+return o;
+}
+@fragment fn fs(i: VSOut)->@location(0) vec4f{
+if(uni.moonGR.w>0.5){ return vec4f(0.12,0.125,0.12,1.0); }  // calib: neutral background
+let N=normalize(i.nrm);
+let L=normalize(-uni.lightDirAmb.xyz);
+let V=normalize(uni.camPosTime.xyz-i.wpos);
+let sc=i.lpos;
+// textureSampleCompare must be in uniform control flow -> sample unconditionally, mask after
+let suv=vec2f(sc.x*0.5+0.5, 1.0-(sc.y*0.5+0.5));
+var s=0.0; let tx=1.0/${SHADOW}.0;
+for(var a=-2;a<=2;a++){ for(var b=-2;b<=2;b++){
+s+=textureSampleCompare(shadowTex,shadowSamp,suv+vec2f(f32(a),f32(b))*(1.5*tx), sc.z-0.0016);
+}}
+let inFrust = sc.x>-1.0 && sc.x<1.0 && sc.y>-1.0 && sc.y<1.0 && sc.z<=1.0 && sc.z>=0.0;
+let shadow = select(1.0, s/25.0, inFrust);   // 5x5 PCF @4096 -> soft, non-aliased shadow edges
+let ndl=max(dot(N,L),0.0);
+let key=uni.keyCol.rgb*uni.keyCol.a*ndl*shadow;
+let amb=mix(uni.fogFar.rgb,uni.fogNear.rgb,0.55)*uni.lightDirAmb.w;
+// warm candle point lights (local illumination with shape)
+var pl=vec3f(0.0);
+for(var li=0;li<16;li++){ let lp=lights[li];
+let dv=lp.xyz-i.wpos; let dd=max(dot(dv,dv),0.02); let ln=dv*inverseSqrt(dd);
+pl+=vec3f(1.0,0.55,0.22)*max(dot(N,ln),0.0)*(max(lp.w,0.0)/(1.0+dd*0.11)); }
+var base=i.col; var emis=vec3f(0.0); let m=i.mat;
+if(m>1.5 && m<2.5){ let H=normalize(V+L); let sp=pow(max(dot(N,H),0.0),42.0)*shadow;
+emis+=uni.keyCol.rgb*sp*1.3+base*0.06; }
+else if(m>2.5 && m<3.5){ let H=normalize(V+L); let sp=pow(max(dot(N,H),0.0),90.0);
+let fr=pow(1.0-max(dot(N,V),0.0),3.0); emis+=vec3f(0.85,0.9,1.0)*(sp*2.2+fr*0.35); base=base*0.25; }
+else if(m>3.5 && m<4.5){ // portrait canvas: sepia oil BUST (lit + structured); haunting carried by the eyes only
+let lz=(fract((i.wpos.z+17.5)/7.0)-0.5)*7.0;      // local horizontal within a 7-wide portrait slot
+let ly=i.wpos.y-6.4;                               // vertical about the face (cy=6 portraits)
+let jaw=1.08 - smoothstep(-0.1,-1.4,ly)*0.4;       // head narrows toward the chin
+let head=smoothstep(1.25,0.45,length(vec2f(lz/jaw,(ly+0.05)*0.82)));
+let neck=smoothstep(0.4,0.0,abs(lz))*smoothstep(-0.55,-1.3,ly);
+let shoulders=smoothstep(1.8,0.7,length(vec2f(lz*0.5,(ly+2.3)*1.25)));   // coat / shoulders
+let eyeL=smoothstep(0.33,0.0,length(vec2f(lz+0.42,ly-0.02)));
+let eyeR=smoothstep(0.33,0.0,length(vec2f(lz-0.42,ly-0.02)));
+let brow=smoothstep(0.13,0.0,abs(ly-0.3))*smoothstep(0.78,0.12,abs(lz));
+let nose=smoothstep(0.09,0.0,abs(lz))*smoothstep(0.3,-0.4,ly)*smoothstep(-0.7,-0.32,ly);
+let cheek=smoothstep(0.85,0.15,length(vec2f((lz-sign(lz)*0.35)*1.2,(ly-0.0))));
+var pc=vec3f(0.05,0.042,0.032);                   // dark oil ground
+pc=mix(pc, vec3f(0.33,0.25,0.165), head);         // sepia skin
+pc=mix(pc, vec3f(0.11,0.085,0.065), clamp(max(shoulders*(1.0-head),neck),0.0,1.0)); // dark coat/neck
+pc+=vec3f(0.07,0.05,0.025)*cheek*head;            // cheek highlight (painterly)
+pc-=vec3f(0.2,0.18,0.15)*(eyeL+eyeR);             // sunken eye sockets
+pc-=vec3f(0.09)*brow; pc-=vec3f(0.06)*nose;
+base=max(pc,vec3f(0.0)); }                         // NO full-face glow -> the green pupil geometry does the haunting
+else if(m>4.5 && m<5.5){ emis+=vec3f(0.14,0.5,0.32)*1.2; }      // moss spectral green
+else if(m>7.5 && m<8.5){ let sp=pow(max(dot(N,V),0.0),70.0); base=vec3f(0.02,0.02,0.03);
+emis+=vec3f(0.95,0.88,0.72)*sp*1.1 + vec3f(0.3,0.55,0.34)*0.7; } // eye: camera glint + sickly haunted glow
+else if(m>8.5 && m<9.5){ emis+=vec3f(1.0,0.58,0.22)*1.8; }       // candle flame
+else if(m>10.5 && m<11.5){ emis+=base*0.28; }                    // eye white (self-lit so it reads)
+else if(m>9.5 && m<10.5){ emis+=vec3f(0.80,0.87,0.73)*2.6; base=vec3f(0.0); } // sick moon (god-ray source)
+else if(m>11.5 && m<12.5){ emis+=base*0.7; base=base*0.1; }      // stained glass (subdued backlit jewel glow)
+var lit=base*(key+amb+pl)+emis;
+let dist=length(uni.camPosTime.xyz-i.wpos);
+var f=clamp(1.0-exp(-dist*uni.fogNear.w),0.0,1.0);
+f=select(f, f*0.15, m>9.5 && m<10.5);                            // moon punches through fog
+let fogCol=mix(uni.fogNear.rgb,uni.fogFar.rgb,f);
+lit=mix(lit,fogCol,f);
+return vec4f(lit,1.0);
+}`;
+const BAT_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+struct VSOut{ @builtin(position) pos: vec4f, @location(0) nrm: vec3f, @location(1) wpos: vec3f };
+@vertex fn vs(@location(0) lp: vec3f,@location(1) ln: vec3f,@location(2) wing: f32,
+@location(3) ipos: vec3f,@location(4) idir: vec3f,@location(5) iph: f32)->VSOut{
+var o:VSOut;
+var P=lp;
+let flap=sin(uni.camPosTime.w*11.0+iph)*0.8;
+P.y += wing * flap * abs(lp.x) * 0.9;
+let f=normalize(idir);
+var r=normalize(cross(vec3f(0,1,0),f)); if(length(r)<0.01){ r=vec3f(1,0,0); }
+let u=cross(f,r);
+let world = ipos + r*P.x + u*P.y + f*(P.z*1.4);
+o.wpos=world; o.nrm=normalize(r*ln.x+u*ln.y+f*ln.z);
+o.pos=uni.viewProj*vec4f(world,1.0);
+return o;
+}
+@fragment fn fs(i:VSOut)->@location(0) vec4f{
+let L=normalize(-uni.lightDirAmb.xyz); let ndl=max(dot(normalize(i.nrm),L),0.0);
+var c=vec3f(0.03,0.03,0.04)*(0.4+ndl*0.8);
+let dist=length(uni.camPosTime.xyz-i.wpos);
+let f=clamp(1.0-exp(-dist*uni.fogNear.w),0.0,1.0);
+c=mix(c,mix(uni.fogNear.rgb,uni.fogFar.rgb,f),f);
+return vec4f(c,1.0);
+}`;
+const DUST_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+struct VSOut{ @builtin(position) pos: vec4f, @location(0) uv: vec2f, @location(1) a: f32 };
+fn h1(n:f32)->f32{ return fract(sin(n*12.9898)*43758.5453); }
+@vertex fn vs(@builtin(vertex_index) vi:u32,@builtin(instance_index) ii:u32)->VSOut{
+var o:VSOut;
+var cs=array<vec2f,6>(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
+let id=f32(ii); let t=uni.camPosTime.w;
+var bx=(h1(id*1.17)-0.5)*26.0;
+var by=2.0+h1(id*2.31)*22.0;
+var bz=-22.0+h1(id*3.57)*30.0;
+by=by - fract(t*0.012 + h1(id*5.1))*6.0;                 // slow fall
+bx+=sin(t*0.15+id)*0.6; bz+=cos(t*0.12+id*1.3)*0.6;      // drift
+let center=vec3f(bx,by,bz);
+// concentrate inside the moonlight shaft (near axis, toward the rose window, upper volume)
+let beam=smoothstep(9.0,1.5,abs(bx))*smoothstep(-26.0,-6.0,bz)*smoothstep(26.0,9.0,by);
+let dist=length(uni.camPosTime.xyz-center);
+let sz=(0.025+h1(id*7.3)*0.05)*(1.0+dist*0.006);         // varied size, holds up far
+let c=cs[vi];
+let world=center+(uni.camRightFlags.xyz*c.x+uni.camUpAspect.xyz*c.y)*sz;
+o.pos=uni.viewProj*vec4f(world,1.0); o.uv=c;
+o.a=beam*0.95*smoothstep(46.0,4.0,dist);                 // ONLY inside the light shaft (no starfield in shadow)
+return o;
+}
+@fragment fn fs(i:VSOut)->@location(0) vec4f{
+let d=length(i.uv); let a=smoothstep(1.0,0.0,d)*i.a;
+return vec4f(vec3f(0.95,0.85,0.6)*a, a);
+}`;
+const CALIB_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+struct VSOut{ @builtin(position) pos: vec4f, @location(0) col: vec3f };
+@vertex fn vs(@location(0) p: vec3f,@location(1) c: vec3f)->VSOut{
+var o:VSOut; o.pos=uni.viewProj*vec4f(p,1.0); o.col=c; return o;
+}
+@fragment fn fs(i:VSOut)->@location(0) vec4f{ return vec4f(i.col*2.0,1.0); } // pure unlit color
+`;
+const POST_WGSL = `${UNI_STRUCT}
+@group(0) @binding(0) var<uniform> uni: Uni;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex: texture_2d<f32>;
+fn h2(p:vec2f)->f32{ return fract(sin(dot(p,vec2f(12.9898,78.233)))*43758.5453); }
+fn aces(x:vec3f)->vec3f{ let a=2.51;let b=0.03;let c=2.43;let d=0.59;let e=0.14;
+return clamp((x*(a*x+b))/(x*(c*x+d)+e),vec3f(0.0),vec3f(1.0)); }
+@vertex fn vs(@builtin(vertex_index) vi:u32)->@builtin(position) vec4f{
+var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3)); return vec4f(p[vi],0.0,1.0);
+}
+@fragment fn fs(@builtin(position) fc: vec4f)->@location(0) vec4f{
+let dim=vec2f(textureDimensions(tex)); let uv=fc.xy/dim;
+var col=textureSample(tex,samp,uv).rgb;
+if(uni.moonGR.w>0.5){ return vec4f(pow(max(col,vec3f(0.0)),vec3f(1.0/2.2)),1.0); } // calib: plain
+// volumetric god rays — radial scatter toward moon screen pos
+let gr=uni.moonGR.z;
+if(gr>0.001){
+let moon=uni.moonGR.xy; let dir=(moon-uv)/40.0; var coord=uv+dir*h2(fc.xy); var dec=1.0; var acc=vec3f(0.0);
+for(var k=0;k<40;k++){ coord+=dir; let s=textureSample(tex,samp,coord).rgb; acc+=max(s-vec3f(0.58),vec3f(0.0))*dec; dec*=0.93; }
+col+=acc*(gr/40.0)*vec3f(0.95,0.85,0.6);    // jittered, high-threshold: only the moon core scatters (no wash, no rings)
+}
+col*=uni.fogFar.w;                      // exposure
+col=aces(col);
+// painterly warm/cool tonal grade (baroque chiaroscuro)
+let luma=dot(col,vec3f(0.299,0.587,0.114));
+let shadowTint=vec3f(0.70,0.96,0.86); let highTint=vec3f(1.14,0.99,0.80);
+col*=mix(shadowTint,highTint,smoothstep(0.0,0.55,luma));
+col=max((col-0.5)*1.08+0.5, vec3f(0.0)); // gentle contrast -> hold blacks without crushing the architecture
+col+=vec3f(0.013,0.016,0.014);           // shadow lift: keep geometry legible without crushing to pure black
+// vignette
+let d=distance(uv,vec2f(0.5)); col*=0.70+0.30*smoothstep(0.95,0.28,d);
+col+=vec3f((h2(fc.xy)-0.5)*2.0/255.0);   // stronger ordered dither (anti-banding)
+return vec4f(pow(max(col,vec3f(0.0)),vec3f(1.0/2.2)),1.0);
+}`;
+// ---- bind group layouts & pipelines
+const bglUni = device.createBindGroupLayout({ entries:[{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{}}] });
+const bglMain = device.createBindGroupLayout({ entries:[
+{binding:0,visibility:GPUShaderStage.VERTEX|GPUShaderStage.FRAGMENT,buffer:{}},
+{binding:1,visibility:GPUShaderStage.FRAGMENT,sampler:{type:'comparison'}},
+{binding:2,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:'depth'}},
+{binding:3,visibility:GPUShaderStage.FRAGMENT,buffer:{}},
+]});
+const bglPost = device.createBindGroupLayout({ entries:[
+{binding:0,visibility:GPUShaderStage.FRAGMENT,buffer:{}},
+{binding:1,visibility:GPUShaderStage.FRAGMENT,sampler:{}},
+{binding:2,visibility:GPUShaderStage.FRAGMENT,texture:{sampleType:'float'}},
+]});
+const HDR='rgba16float', DEPTH='depth24plus', MSAA=4;
+const meshLayout={ arrayStride:40, attributes:[
+{shaderLocation:0,offset:0,format:'float32x3'},{shaderLocation:1,offset:12,format:'float32x3'},
+{shaderLocation:2,offset:24,format:'float32x3'},{shaderLocation:3,offset:36,format:'float32'}]};
+const shadowMod=device.createShaderModule({code:SHADOW_WGSL});
+const shadowPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglUni]}),
+vertex:{module:shadowMod,entryPoint:'vs',buffers:[meshLayout]},
+primitive:{topology:'triangle-list',cullMode:'none'},
+depthStencil:{format:'depth32float',depthWriteEnabled:true,depthCompare:'less'} });
+const mainMod=device.createShaderModule({code:MAIN_WGSL});
+const mainPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglMain]}),
+vertex:{module:mainMod,entryPoint:'vs',buffers:[meshLayout]},
+fragment:{module:mainMod,entryPoint:'fs',targets:[{format:HDR}]},
+primitive:{topology:'triangle-list',cullMode:'none'},
+multisample:{count:MSAA},
+depthStencil:{format:DEPTH,depthWriteEnabled:true,depthCompare:'less'} });
+const batMod=device.createShaderModule({code:BAT_WGSL});
+const batPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglUni]}),
+vertex:{module:batMod,entryPoint:'vs',buffers:[
+{arrayStride:28,attributes:[{shaderLocation:0,offset:0,format:'float32x3'},{shaderLocation:1,offset:12,format:'float32x3'},{shaderLocation:2,offset:24,format:'float32'}]},
+{arrayStride:28,stepMode:'instance',attributes:[{shaderLocation:3,offset:0,format:'float32x3'},{shaderLocation:4,offset:12,format:'float32x3'},{shaderLocation:5,offset:24,format:'float32'}]}]},
+fragment:{module:batMod,entryPoint:'fs',targets:[{format:HDR}]},
+primitive:{topology:'triangle-list',cullMode:'none'},
+multisample:{count:MSAA},
+depthStencil:{format:DEPTH,depthWriteEnabled:true,depthCompare:'less'} });
+const dustMod=device.createShaderModule({code:DUST_WGSL});
+const dustPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglUni]}),
+vertex:{module:dustMod,entryPoint:'vs'},
+fragment:{module:dustMod,entryPoint:'fs',targets:[{format:HDR,blend:{color:{srcFactor:'one',dstFactor:'one'},alpha:{srcFactor:'one',dstFactor:'one'}}}]},
+primitive:{topology:'triangle-list'},
+multisample:{count:MSAA},
+depthStencil:{format:DEPTH,depthWriteEnabled:false,depthCompare:'less'} });
+const calibMod=device.createShaderModule({code:CALIB_WGSL});
+const calibPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglUni]}),
+vertex:{module:calibMod,entryPoint:'vs',buffers:[{arrayStride:24,attributes:[{shaderLocation:0,offset:0,format:'float32x3'},{shaderLocation:1,offset:12,format:'float32x3'}]}]},
+fragment:{module:calibMod,entryPoint:'fs',targets:[{format:HDR}]},
+primitive:{topology:'triangle-list'},
+multisample:{count:MSAA},
+depthStencil:{format:DEPTH,depthWriteEnabled:false,depthCompare:'always'} });
+const postMod=device.createShaderModule({code:POST_WGSL});
+const postPipe=device.createRenderPipeline({ layout:device.createPipelineLayout({bindGroupLayouts:[bglPost]}),
+vertex:{module:postMod,entryPoint:'vs'},
+fragment:{module:postMod,entryPoint:'fs',targets:[{format:fmt}]},
+primitive:{topology:'triangle-list'} });
+const bgUni = device.createBindGroup({ layout:bglUni, entries:[{binding:0,resource:{buffer:uBuf}}] });
+let bgMain, bgPost, hdrTex, hdrView, msColorTex, msColorView, depthTex, depthView;
+// ---- timestamp query
+let qs=null, resolveBuf=null, readBuf=null, mapPending=false;
+if(hasTS){ qs=device.createQuerySet({type:'timestamp',count:2});
+resolveBuf=device.createBuffer({size:16,usage:GPUBufferUsage.QUERY_RESOLVE|GPUBufferUsage.COPY_SRC});
+readBuf=device.createBuffer({size:16,usage:GPUBufferUsage.MAP_READ|GPUBufferUsage.COPY_DST}); }
+// ---- frame log ring buffer (preallocated)
+const RING=4096; const frameLog=new Float32Array(RING); let ringN=0, ringHead=0;
+window.__frameLog=frameLog;
+function pushFrame(ms){ frameLog[ringHead]=ms; ringHead=(ringHead+1)%RING; if(ringN<RING)ringN++; }
+window.__perf=function(){ if(ringN===0) return {avg:0,p99:0,max:0,count:0};
+let sum=0,max=0; const tmp=[]; for(let i=0;i<ringN;i++){ const v=frameLog[i]; sum+=v; if(v>max)max=v; tmp.push(v); }
+tmp.sort((a,b)=>a-b); const p99=tmp[Math.min(tmp.length-1,Math.floor(tmp.length*0.99))];
+return {avg:+(sum/ringN).toFixed(3),p99:+p99.toFixed(3),max:+max.toFixed(3),count:ringN,source:hasTS?'gpu':'cpu',gpu:adapterName}; };
+// ---- resize / targets
+function resize(){
+const dpr=Math.min(window.devicePixelRatio||1, 2);
+const cw=canvas.clientWidth||window.innerWidth, ch=canvas.clientHeight||window.innerHeight;
+const w=Math.max(1,Math.floor(cw*dpr)), h=Math.max(1,Math.floor(ch*dpr));
+if(w<=1 || h<=1) return;                                   // ignore transient zero-size reflow (black-frame race)
+if(canvas.width===w && canvas.height===h && hdrTex) return;
+canvas.width=w; canvas.height=h;
+if(hdrTex)hdrTex.destroy(); if(msColorTex)msColorTex.destroy(); if(depthTex)depthTex.destroy();
+hdrTex=device.createTexture({size:[w,h],format:HDR,usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING}); hdrView=hdrTex.createView();
+msColorTex=device.createTexture({size:[w,h],format:HDR,sampleCount:MSAA,usage:GPUTextureUsage.RENDER_ATTACHMENT}); msColorView=msColorTex.createView();
+depthTex=device.createTexture({size:[w,h],format:DEPTH,sampleCount:MSAA,usage:GPUTextureUsage.RENDER_ATTACHMENT}); depthView=depthTex.createView();
+bgMain=device.createBindGroup({layout:bglMain,entries:[{binding:0,resource:{buffer:uBuf}},{binding:1,resource:shadowSamp},{binding:2,resource:shadowView},{binding:3,resource:{buffer:lightsBuf}}]});
+bgPost=device.createBindGroup({layout:bglPost,entries:[{binding:0,resource:{buffer:uBuf}},{binding:1,resource:linSamp},{binding:2,resource:hdrView}]});
+}
+window.addEventListener('resize',resize);
+try{ new ResizeObserver(()=>resize()).observe(canvas); }catch(e){}
+resize();
+// ------------------------------------------------------------------ camera & controls
+const cam={ x:-14, y:5, z:17, yaw:0.5, pitch:-0.12 };
+window.__cam=cam;
+const keys=Object.create(null);
+let locked=false;
+if(!CAPTURE){
+canvas.addEventListener('click',()=>canvas.requestPointerLock());
+document.addEventListener('pointerlockchange',()=>{ locked=document.pointerLockElement===canvas; });
+document.addEventListener('mousemove',e=>{ if(!locked)return; cam.yaw+=e.movementX*0.0022; cam.pitch-=e.movementY*0.0022;
+cam.pitch=Math.max(-1.5,Math.min(1.5,cam.pitch)); });
+addEventListener('keydown',e=>{keys[e.code]=true;}); addEventListener('keyup',e=>{keys[e.code]=false;});
+msg.textContent='Click para capturar el mouse · WASD mover · Q/E subir/bajar · Shift acelerar';
+}
+// 6 fixed poses as {eye, target}
+const POSES=[
+[-9,5,13,   2,8,-10],     // 0 opening: columns foreground + staircase + chandelier
+[ 9,4,10,  -6,6,-9],      // 1 down the arched gallery (off the column axis)
+[-8.5,6.3,6, -18.9,6.4,-4], // 2 angled down the haunted portrait gallery (faces + eyes receding)
+[ 4,8,10,  -2,12,-11],    // 3 bats over the atrium + chandelier
+[ 2,6,13,   0.5,15,-24],  // 4 backlit god rays through the rose window / moon
+[ 11,12,16, -3,6,-11],    // 5 panoramic over the atrium (foreground columns)
+];
+// flythrough control points (inside bounds)
+const CTRL=[ [-15,5,18],[ -8,4,6],[ 12,4,4],[ 10,7,-10],[0,11,-16],[-10,6,-6],[-14,4,8],[0,14,16] ];
+const LOOK=[ [0,10,-16],[-6,5,-10],[-8,6,-12],[0,10,-18],[0,16,-25],[12,8,-4],[-18,5,0],[0,8,-10] ];
+function catmull(p,t,out,arr){ const n=arr.length; const f=t*n; let i=Math.floor(f); const lf=f-i;
+const a=arr[(i-1+n)%n], b=arr[i%n], c=arr[(i+1)%n], d=arr[(i+2)%n];
+for(let k=0;k<3;k++){ const p0=a[k],p1=b[k],p2=c[k],p3=d[k];
+out[k]=0.5*((2*p1)+(-p0+p2)*lf+(2*p0-5*p1+4*p2-p3)*lf*lf+(-p0+3*p1-3*p2+p3)*lf*lf*lf); } }
+const _cp=[0,0,0], _cl=[0,0,0];
+let flyT=0;
+function clampCam(){ // collision: stay inside the room, above the floor
+cam.x=Math.max(-18.5,Math.min(18.5,cam.x));
+cam.z=Math.max(-23.5,Math.min(23.5,cam.z));
+cam.y=Math.max(0.8,Math.min(27,cam.y));
+}
+// moonlight direction (travels into the room, from the rose window, raking down)
+const LIGHT_DIR=(()=>{ const d=[0.12,-0.5,1.0]; const l=Math.hypot(d[0],d[1],d[2]); return [d[0]/l,d[1]/l,d[2]/l]; })();
+const MOON_WORLD=[1.5,17.5,-40];   // behind the rose window
+// static light matrix (orthographic, covers the atrium)
+const lightVP=new Float32Array(16); {
+const lv=new Float32Array(16), lo=new Float32Array(16);
+const cx=0,cy=8,cz=-4, dist=55;
+mLookAt(lv, cx-LIGHT_DIR[0]*dist, cy-LIGHT_DIR[1]*dist, cz-LIGHT_DIR[2]*dist, cx,cy,cz, 0,1,0);
+mOrthoZO(lo, -34,34, -22,30, 1, 110);
+mMul(lightVP, lo, lv);
+}
+// ---- scratch matrices (module scope — no per-frame alloc)
+const _view=new Float32Array(16), _proj=new Float32Array(16), _vp=new Float32Array(16);
+let last=performance.now(), started=false, frameCount=0;
+function frame(now){
+let dt=(now-last)/1000; last=now; if(dt>0.1)dt=0.1; if(dt<=0)dt=0.0001;
+const t=now/1000;
+// --- camera placement
+let ex,ey,ez,tx,ty,tz, usePose=false;
+if(CALIB){ ex=CALIB_POS[0];ey=CALIB_POS[1];ez=CALIB_POS[2]; tx=ex;ty=ey;tz=ez-6; usePose=true; }
+else if(POSE>=0){ const p=POSES[POSE]; ex=p[0];ey=p[1];ez=p[2]; tx=p[3];ty=p[4];tz=p[5]; usePose=true; }
+else if(FLY){ flyT+=dt/60; if(flyT>1)flyT-=1; catmull(_cp,flyT,_cp,CTRL); catmull(_cl,flyT,_cl,LOOK);
+cam.x=_cp[0];cam.y=_cp[1];cam.z=_cp[2]; clampCam();
+ex=cam.x;ey=cam.y;ez=cam.z; tx=_cl[0];ty=_cl[1];tz=_cl[2]; usePose=true; }
+else { // free fly
+const sp=(keys['ShiftLeft']||keys['ShiftRight']?26:9)*dt;
+const cy=Math.cos(cam.pitch), fx=Math.sin(cam.yaw)*cy, fy=Math.sin(cam.pitch), fz=-Math.cos(cam.yaw)*cy;
+const rx=Math.cos(cam.yaw), rz=Math.sin(cam.yaw);
+if(keys['KeyW']){cam.x+=fx*sp;cam.y+=fy*sp;cam.z+=fz*sp;}
+if(keys['KeyS']){cam.x-=fx*sp;cam.y-=fy*sp;cam.z-=fz*sp;}
+if(keys['KeyA']){cam.x-=rx*sp;cam.z-=rz*sp;}
+if(keys['KeyD']){cam.x+=rx*sp;cam.z+=rz*sp;}
+if(keys['KeyQ'])cam.y+=sp; if(keys['KeyE'])cam.y-=sp;
+clampCam();
+ex=cam.x;ey=cam.y;ez=cam.z;
+tx=ex+fx; ty=ey+fy; tz=ez+fz;
+}
+// --- view / proj
+const aspect=canvas.width/canvas.height;
+mLookAt(_view, ex,ey,ez, tx,ty,tz, 0,1,0);
+mPerspZO(_proj, CALIB?1.05:1.1, aspect, 0.1, 400);
+mMul(_vp,_proj,_view);
+// camera basis (for billboarded dust)
+let fvx=tx-ex,fvy=ty-ey,fvz=tz-ez; let fl=1/(Math.hypot(fvx,fvy,fvz)||1); fvx*=fl;fvy*=fl;fvz*=fl;
+let rvx=fvy*0-fvz*1, rvy=fvz*0-fvx*0, rvz=fvx*1-fvy*0; // cross(f,(0,1,0))
+rvx=fvz; rvy=0; rvz=-fvx; let rl2=1/(Math.hypot(rvx,rvy,rvz)||1); rvx*=rl2;rvz*=rl2;
+const uvx=rvy*fvz-rvz*fvy? 0:0; // (compute up = cross(r,f))
+const upx=rvy*fvz-rvz*fvy, upy=rvz*fvx-rvx*fvz, upz=rvx*fvy-rvy*fvx;
+// moon screen position for god rays
+const mw=MOON_WORLD; const cxp=_vp[0]*mw[0]+_vp[4]*mw[1]+_vp[8]*mw[2]+_vp[12];
+const cyp=_vp[1]*mw[0]+_vp[5]*mw[1]+_vp[9]*mw[2]+_vp[13];
+const cwp=_vp[3]*mw[0]+_vp[7]*mw[1]+_vp[11]*mw[2]+_vp[15];
+let moonU=0.5,moonV=0.5,gr=0; if(cwp>0){ moonU=(cxp/cwp)*0.5+0.5; moonV=1.0-((cyp/cwp)*0.5+0.5);
+if(moonU>-0.3&&moonU<1.3&&moonV>-0.3&&moonV<1.3) gr=NO_VOL?0:0.42; }
+// --- fill uniforms (in place)
+uF32.set(_vp,0); uF32.set(lightVP,16);
+uF32[32]=ex;uF32[33]=ey;uF32[34]=ez;uF32[35]=t;
+uF32[36]=LIGHT_DIR[0];uF32[37]=LIGHT_DIR[1];uF32[38]=LIGHT_DIR[2];uF32[39]=0.26; // ambient (fills architecture, still moody)
+uF32[40]=0.05;uF32[41]=0.038;uF32[42]=0.022;uF32[43]=0.0085;                    // fogNear rgb + density
+uF32[44]=0.01;uF32[45]=0.02;uF32[46]=0.017;uF32[47]=1.25;                       // fogFar rgb + exposure
+uF32[48]=rvx;uF32[49]=rvy;uF32[50]=rvz;uF32[51]=0;
+uF32[52]=upx;uF32[53]=upy;uF32[54]=upz;uF32[55]=aspect;
+uF32[56]=moonU;uF32[57]=moonV;uF32[58]=gr;uF32[59]=CALIB?1:0;
+uF32[60]=0.62;uF32[61]=0.72;uF32[62]=0.92;uF32[63]=1.4;                         // key moon color + strength
+device.queue.writeBuffer(uBuf,0,uF32);
+// --- flock
+if(NBAT>0 && !CALIB){ updateFlock(dt); device.queue.writeBuffer(batInstBuf,0,batInstF32); }
+// --- encode
+const enc=device.createCommandEncoder();
+// shadow pass
+if(!CALIB){
+const sp=enc.beginRenderPass({colorAttachments:[],depthStencilAttachment:{view:shadowView,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'}});
+sp.setPipeline(shadowPipe); sp.setBindGroup(0,bgUni); sp.setVertexBuffer(0,meshVBO); sp.setIndexBuffer(meshIBO,'uint32');
+sp.drawIndexed(idxU32.length); sp.end();
+}
+// main pass -> HDR
+const mpDesc={ colorAttachments:[{view:msColorView,resolveTarget:hdrView,clearValue:{r:0.01,g:0.02,b:0.018,a:1},loadOp:'clear',storeOp:'store'}],
+depthStencilAttachment:{view:depthView,depthClearValue:1,depthLoadOp:'clear',depthStoreOp:'store'} };
+if(hasTS) mpDesc.timestampWrites={querySet:qs,beginningOfPassWriteIndex:0,endOfPassWriteIndex:1};
+const mp=enc.beginRenderPass(mpDesc);
+mp.setPipeline(mainPipe); mp.setBindGroup(0,bgMain); mp.setVertexBuffer(0,meshVBO); mp.setIndexBuffer(meshIBO,'uint32'); mp.drawIndexed(idxU32.length);
+if(CALIB){ mp.setPipeline(calibPipe); mp.setBindGroup(0,bgUni); mp.setVertexBuffer(0,calibVBO); mp.draw(calibF32.length/6); }
+else {
+if(NBAT>0){ mp.setPipeline(batPipe); mp.setBindGroup(0,bgUni); mp.setVertexBuffer(0,batVBO); mp.setVertexBuffer(1,batInstBuf); mp.draw(batVertCount,NBAT); }
+if(!NO_RAIN){ mp.setPipeline(dustPipe); mp.setBindGroup(0,bgUni); mp.draw(6,550); }
+}
+mp.end();
+// post -> swapchain
+const pp=enc.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),clearValue:{r:0,g:0,b:0,a:1},loadOp:'clear',storeOp:'store'}]});
+pp.setPipeline(postPipe); pp.setBindGroup(0,bgPost); pp.draw(3); pp.end();
+// Only resolve/copy into readBuf when no map is in flight — copying into a buffer that still has a
+// pending mapAsync is invalid and intermittently corrupts the presented frame (black-frame bug).
+const doTS = hasTS && !mapPending;
+if(doTS){ enc.resolveQuerySet(qs,0,2,resolveBuf,0); enc.copyBufferToBuffer(resolveBuf,0,readBuf,0,16); }
+device.queue.submit([enc.finish()]);
+// --- timing
+if(doTS){ mapPending=true;
+readBuf.mapAsync(GPUMapMode.READ).then(()=>{ const a=new BigInt64Array(readBuf.getMappedRange());
+const ns=Number(a[1]-a[0]); readBuf.unmap(); if(ns>0&&ns<1e9) pushFrame(ns*1e-6); mapPending=false; })
+.catch(()=>{ mapPending=false; }); }
+else if(!hasTS){ pushFrame(dt*1000); }
+// __ready marks the first VALID frame — gate on a few warmup frames + a real-size canvas so
+// capture tools never screenshot an early black/incomplete frame (shadow map / pipelines warming).
+frameCount++;
+if(!started && frameCount>=10 && canvas.width>300){ started=true; window.__ready=true; }
+if(!CAPTURE && hud.style.display!=='none'){ hudAcc+=dt; if(hudAcc>0.25){ hudAcc=0;
+const p=window.__perf(); hud.textContent='pos '+ex.toFixed(1)+','+ey.toFixed(1)+','+ez.toFixed(1)+'\n'+(p.source)+' avg '+p.avg+'ms  max '+p.max+'ms\nbats '+NBAT+'  verts '+vcount; } }
+requestAnimationFrame(frame);
+}
+let hudAcc=0;
+window.__ready=false;
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
