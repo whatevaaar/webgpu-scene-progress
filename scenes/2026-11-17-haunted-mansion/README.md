@@ -19,6 +19,7 @@ sobre negro).
 - `scene-spec.md` — el spec que la generó.
 - `renders/pose0..5.png` — las 6 poses fijas a 2560×1440.
 - `video_horizontal.webm` (1920×1080) · `video_vertical.webm` (1080×1920) — clips de 6 s del fly-through.
+- `video_horizontal_20s.webm` (1920×1080) — recorrido completo de 20 s.
 
 ## Controles
 Click = pointer-lock · **WASD** mover · **mouse** mirar · **Q/E** bajar/subir · **Shift** acelerar.
